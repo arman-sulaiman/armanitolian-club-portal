@@ -1,0 +1,64 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", "SolaimanLipi", system-ui, -apple-system, sans-serif;
+  --font-bangla: "SolaimanLipi", "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Official Institutional Petrol Blue & Neutral Palette (Consular Portal Style) */
+  --color-navy-950: #002B45;
+  --color-navy-900: #004B76;
+  --color-navy-800: #003B5C;
+  --color-navy-700: #005F94;
+  --color-gold-600: #004B76;
+  --color-gold-500: #005F94;
+  --color-gold-400: #3888B5;
+  --color-gold-100: #EBF4FA;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #f3f5f7;
+    color: #1a202c;
+  }
+
+  body.lang-bn {
+    font-family: var(--font-bangla);
+    line-height: 1.7;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle institutional scrollbar */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f4f6;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Print styling for official receipts */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #ffffff !important;
+  }
+}

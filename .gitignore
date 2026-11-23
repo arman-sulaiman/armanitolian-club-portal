@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.vercel/
+promo-video/
+server/data/*.db
+server/data/*.db-shm
+server/data/*.db-wal
+*.log
+*.mp4
