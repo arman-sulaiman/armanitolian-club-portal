@@ -1,6 +1,9 @@
-# Armanitollian Club — Member Portal & Management System
+# The Armanitolian's Club — Member Portal & Management System
 
-Enterprise-level bilingual (**English & বাংলা**) web application for **Armanitollian Club** (Armanitola Govt. High School Alumni Association) built with **React, Tailwind CSS v4, Express, SQLite (`node:sqlite`), and ShurjoPay v2**.
+Enterprise-level bilingual (**English & বাংলা**) web application for **The Armanitolian's Club** (An initiative of Armanitola Govt. High School's Ex-Students · Estd. 2025) built with **React, Tailwind CSS v4, Express, SQLite (`node:sqlite`), ShurjoPay v2, and GreenWeb SMS**.
+
+- **Live Vercel URL:** https://armanitolian-club-portal.vercel.app
+- **Auto-Deploy:** Connected to GitHub (`main` branch) — every push automatically deploys to Vercel.
 
 ---
 
