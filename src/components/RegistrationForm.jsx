@@ -56,17 +56,76 @@ const initialFormState = {
   customValues: {},
 };
 
-export default function RegistrationForm({ isPublic = false }) {
+const DRAFT_STORAGE_KEY = 'armanitolian_reg_draft_v1';
+
+function loadSavedDraft(defaultPlanId) {
+  try {
+    const raw = localStorage.getItem(DRAFT_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.form) {
+      return {
+        step: Number(parsed.step) >= 1 && Number(parsed.step) <= 5 ? Number(parsed.step) : 1,
+        form: { ...initialFormState, planId: defaultPlanId, ...parsed.form },
+      };
+    }
+  } catch {
+    // ignore corrupt draft
+  }
+  return null;
+}
+
+export default function RegistrationForm({
+  isPublic = false,
+  revisionData = null,
+  revisionToken = '',
+  onRevisionSuccess = null,
+}) {
   const { lang, t, plans, settings, submitRegistration, showToast, setActiveTab, setRoute } = useApp();
+  const isRevisionMode = Boolean(revisionData && revisionToken);
   const enabledPlans = plans.filter((p) => p.enabled !== false);
-  const [step, setStep] = useState(1);
-  const [form, setForm] = useState({
-    ...initialFormState,
-    planId: enabledPlans[0]?.id || 'plan-permanent',
-  });
+  const defaultPlanId = enabledPlans[0]?.id || 'plan-permanent';
+
+  const savedDraft = !isRevisionMode ? loadSavedDraft(defaultPlanId) : null;
+
+  const [step, setStep] = useState(() => (isRevisionMode ? 1 : savedDraft?.step || 1));
+  const [form, setForm] = useState(() =>
+    isRevisionMode
+      ? { ...initialFormState, ...revisionData }
+      : savedDraft?.form || { ...initialFormState, planId: defaultPlanId }
+  );
   const [errors, setErrors] = useState({});
   const [submittedApp, setSubmittedApp] = useState(null);
   const [submitting, setSubmitting] = useState(false);
+
+  // Auto-save form & step to localStorage across page reloads
+  useEffect(() => {
+    if (isRevisionMode || submittedApp) return;
+    try {
+      localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify({ step, form }));
+    } catch {
+      // If large base64 files exceed quota, still persist all text fields & step safely
+      try {
+        const lightForm = {
+          ...form,
+          photo: null,
+          nidPdfData: null,
+          sscProofData: null,
+        };
+        localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify({ step, form: lightForm }));
+      } catch {
+        // ignore storage unavailable
+      }
+    }
+  }, [form, step, isRevisionMode, submittedApp]);
+
+  const clearDraft = () => {
+    localStorage.removeItem(DRAFT_STORAGE_KEY);
+    setForm({ ...initialFormState, planId: defaultPlanId });
+    setStep(1);
+    setErrors({});
+    showToast(lang === 'bn' ? 'খসড়া মুছে ফেলা হয়েছে।' : 'Saved draft cleared.', 'info');
+  };
 
   // Step 5 SMS OTP Verification State
   const [otpDigits, setOtpDigits] = useState(['', '', '', '', '', '']);
@@ -268,7 +327,7 @@ export default function RegistrationForm({ isPublic = false }) {
       if (!form.photo) errs.photo = true;
       if (!form.nidPdfName) errs.nidPdfName = true;
       if (!form.sscProofName) errs.sscProofName = true;
-      if (!otpVerified) errs.otp = true;
+      if (!isRevisionMode && !otpVerified) errs.otp = true;
     }
 
     setErrors(errs);
@@ -294,9 +353,25 @@ export default function RegistrationForm({ isPublic = false }) {
     if (!validateStep(5)) return;
     setSubmitting(true);
     try {
-      const created = await submitRegistration({ ...form, otpToken });
-      setSubmittedApp(created);
-      showToast(t('registration.successTitle'), 'success');
+      if (isRevisionMode) {
+        const res = await apiRequest('/api/public/revision/resubmit', {
+          method: 'PUT',
+          body: JSON.stringify({ revisionToken, updates: form }),
+        });
+        setSubmittedApp(res.member);
+        showToast(
+          lang === 'bn'
+            ? 'সংশোধিত আবেদন সফলভাবে পুনরায় জমা হয়েছে!'
+            : 'Revised application resubmitted successfully!',
+          'success'
+        );
+        if (onRevisionSuccess) onRevisionSuccess(res.member);
+      } else {
+        const created = await submitRegistration({ ...form, otpToken });
+        localStorage.removeItem(DRAFT_STORAGE_KEY);
+        setSubmittedApp(created);
+        showToast(t('registration.successTitle'), 'success');
+      }
     } catch (err) {
       showToast(err.message || 'Registration failed', 'error');
     } finally {
@@ -370,13 +445,35 @@ export default function RegistrationForm({ isPublic = false }) {
   return (
     <div className="max-w-4xl mx-auto space-y-6">
       {/* Header */}
-      <div className="bg-white p-6 border border-slate-200">
-        <div>
-          <h1 className="text-xl sm:text-2xl font-bold text-[#004B76]">
-            {t('registration.title')}
-          </h1>
-          <p className="text-sm text-slate-600 mt-1">{t('registration.subtitle')}</p>
+      <div className="bg-white p-5 sm:p-6 border border-slate-200">
+        <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+          <div>
+            <h1 className="text-xl sm:text-2xl font-bold text-[#004B76]">
+              {isRevisionMode
+                ? lang === 'bn'
+                  ? 'আবেদন সংশোধন ও পুনরায় জমা'
+                  : 'Edit & Resubmit Application'
+                : t('registration.title')}
+            </h1>
+            <p className="text-sm text-slate-600 mt-1">{t('registration.subtitle')}</p>
+          </div>
+          {!isRevisionMode && (
+            <button
+              type="button"
+              onClick={clearDraft}
+              className="self-start text-xs font-semibold text-slate-500 hover:text-rose-700 underline underline-offset-4 shrink-0"
+            >
+              {lang === 'bn' ? 'ফর্ম রিসেট করুন' : 'Clear saved draft'}
+            </button>
+          )}
         </div>
+
+        {isRevisionMode && revisionData?.remarks && (
+          <div className="mt-4 p-3.5 bg-amber-50 border-l-4 border-amber-500 text-xs text-amber-900">
+            <strong>{lang === 'bn' ? 'কমিটির সংশোধন নোট:' : 'Committee Revision Note:'}</strong>{' '}
+            {revisionData.remarks}
+          </div>
+        )}
 
         {/* Clean Institutional Stepper (5 Steps) */}
         <div className="mt-6 grid grid-cols-2 sm:grid-cols-5 gap-2">
@@ -1009,37 +1106,37 @@ export default function RegistrationForm({ isPublic = false }) {
               </div>
             </div>
 
-            {/* NID PDF Upload */}
+            {/* NID PDF or Image Upload */}
             <div
-              className={`p-5 rounded-2xl border-2 border-dashed transition-colors ${
+              className={`p-4 sm:p-5 rounded-xl border-2 border-dashed transition-colors ${
                 errors.nidPdfName ? 'border-rose-400 bg-rose-50/40' : 'border-slate-300 bg-slate-50/60'
               }`}
             >
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div className="flex items-start gap-3.5">
-                  <div className="w-11 h-11 rounded-xl bg-rose-100 text-rose-700 flex items-center justify-center shrink-0">
+                <div className="flex items-start gap-3 min-w-0">
+                  <div className="w-10 h-10 sm:w-11 sm:h-11 rounded-xl bg-rose-100 text-rose-700 flex items-center justify-center shrink-0">
                     <FileText className="w-5 h-5" />
                   </div>
-                  <div>
+                  <div className="min-w-0">
                     <h4 className="text-sm font-bold text-navy-900">
                       {t('registration.nidPdf')} <span className="text-rose-500">*</span>
                     </h4>
                     <p className="text-xs text-slate-500 mt-0.5">{t('registration.nidPdfHint')}</p>
                     {form.nidPdfName && (
-                      <p className="text-xs text-emerald-700 font-semibold mt-1.5 flex items-center gap-1">
-                        <CheckCircle2 className="w-3.5 h-3.5" /> {form.nidPdfName}
+                      <p className="text-xs text-emerald-700 font-semibold mt-1.5 flex items-center gap-1 break-all">
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> {form.nidPdfName}
                       </p>
                     )}
                   </div>
                 </div>
-                <label className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white border border-slate-300 text-slate-800 text-xs font-semibold cursor-pointer hover:bg-slate-100 shrink-0">
+                <label className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-full bg-white border border-[#004B76] text-[#004B76] text-xs font-semibold cursor-pointer hover:bg-[#EBF4FA] shrink-0">
                   <Upload className="w-3.5 h-3.5" />
                   {form.nidPdfName ? t('registration.changeFile') : t('registration.uploadClick')}
                   <input
                     type="file"
-                    accept="application/pdf,.pdf"
+                    accept="application/pdf,image/png,image/jpeg,image/webp,.pdf"
                     className="hidden"
-                    onChange={(e) => handleFileUpload('nidPdf', e.target.files?.[0], ['pdf'])}
+                    onChange={(e) => handleFileUpload('nidPdf', e.target.files?.[0], ['pdf', 'image'])}
                   />
                 </label>
               </div>
@@ -1047,33 +1144,33 @@ export default function RegistrationForm({ isPublic = false }) {
 
             {/* SSC Passing Proof Upload */}
             <div
-              className={`p-5 rounded-2xl border-2 border-dashed transition-colors ${
+              className={`p-4 sm:p-5 rounded-xl border-2 border-dashed transition-colors ${
                 errors.sscProofName ? 'border-rose-400 bg-rose-50/40' : 'border-slate-300 bg-slate-50/60'
               }`}
             >
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div className="flex items-start gap-3.5">
-                  <div className="w-11 h-11 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center shrink-0">
+                <div className="flex items-start gap-3 min-w-0">
+                  <div className="w-10 h-10 sm:w-11 sm:h-11 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center shrink-0">
                     <FileText className="w-5 h-5" />
                   </div>
-                  <div>
+                  <div className="min-w-0">
                     <h4 className="text-sm font-bold text-navy-900">
                       {t('registration.sscProof')} <span className="text-rose-500">*</span>
                     </h4>
                     <p className="text-xs text-slate-500 mt-0.5">{t('registration.sscProofHint')}</p>
                     {form.sscProofName && (
-                      <p className="text-xs text-emerald-700 font-semibold mt-1.5 flex items-center gap-1">
-                        <CheckCircle2 className="w-3.5 h-3.5" /> {form.sscProofName}
+                      <p className="text-xs text-emerald-700 font-semibold mt-1.5 flex items-center gap-1 break-all">
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> {form.sscProofName}
                       </p>
                     )}
                   </div>
                 </div>
-                <label className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white border border-slate-300 text-slate-800 text-xs font-semibold cursor-pointer hover:bg-slate-100 shrink-0">
+                <label className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-full bg-white border border-[#004B76] text-[#004B76] text-xs font-semibold cursor-pointer hover:bg-[#EBF4FA] shrink-0">
                   <Upload className="w-3.5 h-3.5" />
                   {form.sscProofName ? t('registration.changeFile') : t('registration.uploadClick')}
                   <input
                     type="file"
-                    accept="application/pdf,image/png,image/jpeg,.pdf"
+                    accept="application/pdf,image/png,image/jpeg,image/webp,.pdf"
                     className="hidden"
                     onChange={(e) => handleFileUpload('sscProof', e.target.files?.[0], ['pdf', 'image'])}
                   />
@@ -1081,9 +1178,10 @@ export default function RegistrationForm({ isPublic = false }) {
               </div>
             </div>
 
-            {/* SMS OTP Verification Card (Consular Confirmation Code Style) */}
+            {/* SMS OTP Verification Card (Skipped in Revision Mode since OTP already verified) */}
+            {!isRevisionMode && (
             <div
-              className={`p-6 border transition-colors ${
+              className={`p-4 sm:p-6 border transition-colors ${
                 otpVerified
                   ? 'border-emerald-300 bg-emerald-50/40'
                   : errors.otp
@@ -1124,7 +1222,7 @@ export default function RegistrationForm({ isPublic = false }) {
                     type="button"
                     disabled={otpSending}
                     onClick={sendOtpCode}
-                    className="px-5 py-2.5 rounded-full bg-[#004B76] hover:bg-[#003B5C] text-white text-xs font-semibold shrink-0 disabled:opacity-50"
+                    className="w-full sm:w-auto px-5 py-2.5 rounded-full bg-[#004B76] hover:bg-[#003B5C] text-white text-xs font-semibold shrink-0 disabled:opacity-50"
                   >
                     {otpSending
                       ? lang === 'bn'
@@ -1138,12 +1236,12 @@ export default function RegistrationForm({ isPublic = false }) {
               </div>
 
               {otpSent && !otpVerified && (
-                <div className="mt-5 p-6 bg-[#F1F4F6] flex flex-col items-center space-y-4">
+                <div className="mt-5 p-4 sm:p-6 bg-[#F1F4F6] flex flex-col items-center space-y-4">
                   <p className="text-xs font-semibold text-slate-700">
                     {lang === 'bn' ? 'আপনার ৬ ডিজিটের কনফার্মেশন কোড' : 'Your confirmation code'}
                   </p>
 
-                  <div className="flex items-center justify-center gap-2 sm:gap-2.5">
+                  <div className="flex items-center justify-center gap-1.5 sm:gap-2.5 w-full">
                     {otpDigits.map((digit, idx) => (
                       <input
                         key={idx}
@@ -1156,12 +1254,12 @@ export default function RegistrationForm({ isPublic = false }) {
                         value={digit}
                         onChange={(e) => handleOtpDigitChange(idx, e.target.value)}
                         onKeyDown={(e) => handleOtpKeyDown(idx, e)}
-                        className="w-11 h-12 sm:w-12 sm:h-14 text-center text-xl font-bold font-mono bg-white border border-slate-300 focus:border-[#004B76] focus:ring-2 focus:ring-[#004B76]/20 outline-none rounded-xs text-slate-900"
+                        className="w-10 h-11 sm:w-12 sm:h-14 text-center text-lg sm:text-xl font-bold font-mono bg-white border border-slate-300 focus:border-[#004B76] focus:ring-2 focus:ring-[#004B76]/20 outline-none rounded-xs text-slate-900"
                       />
                     ))}
                   </div>
 
-                  {otpError && <p className="text-xs font-semibold text-rose-700">{otpError}</p>}
+                  {otpError && <p className="text-xs font-semibold text-rose-700 text-center">{otpError}</p>}
 
                   <button
                     type="button"
@@ -1178,7 +1276,7 @@ export default function RegistrationForm({ isPublic = false }) {
                       : 'Verify code'}
                   </button>
 
-                  <p className="text-xs text-slate-600">
+                  <p className="text-xs text-slate-600 text-center">
                     {lang === 'bn' ? 'কোড পাননি?' : "Haven't received a code yet?"}{' '}
                     {resendTimer > 0 ? (
                       <span className="font-mono text-slate-500">
@@ -1198,6 +1296,7 @@ export default function RegistrationForm({ isPublic = false }) {
                 </div>
               )}
             </div>
+            )}
           </div>
         )}
 

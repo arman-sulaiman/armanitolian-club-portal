@@ -293,6 +293,9 @@ app.post('/api/public/track', (req, res) => {
       memberId: match.memberId,
       fullName: match.fullName,
       batch: match.batch,
+      phoneMasked: match.phone
+        ? `${match.phone.slice(0, 4)}****${match.phone.slice(-3)}`
+        : '',
       status: match.status,
       submittedAt: match.submittedAt,
       approvedAt: match.approvedAt,
@@ -302,6 +305,114 @@ app.post('/api/public/track', (req, res) => {
       photo: match.photo,
     },
   });
+});
+
+// Public: Send OTP for Revision Edit (looks up registered phone by trackingId)
+app.post('/api/public/revision/send-otp', async (req, res) => {
+  const trackingId = String(req.body?.trackingId || '').trim();
+  const member = getAllMembers().find(
+    (m) => m.id.toLowerCase() === trackingId.toLowerCase() && m.status === 'revision'
+  );
+  if (!member) {
+    return res.status(404).json({ error: 'Application not found or not marked for revision.' });
+  }
+  const normPhone = normalizePhone(member.phone);
+  const code = String(crypto.randomInt(100000, 1000000));
+  const expiresAt = Date.now() + 5 * 60 * 1000;
+
+  db.prepare(
+    `INSERT OR REPLACE INTO otp_verifications (phone_normalized, code, expires_at, verified, attempts)
+     VALUES (?, ?, ?, 0, 0)`
+  ).run(normPhone, code, expiresAt);
+
+  const smsResult = await dispatchSms({
+    to: member.phone,
+    recipientName: member.fullName,
+    triggerType: 'AUTO_REVISION_OTP',
+    message: `Your Armanitolians Club revision verification code is ${code}. Valid for 5 minutes. Do not share this code.`,
+  });
+
+  const maskedPhone =
+    member.phone.length >= 6
+      ? `${member.phone.slice(0, 4)}****${member.phone.slice(-3)}`
+      : member.phone;
+
+  res.json({ ok: true, maskedPhone, smsDelivered: smsResult.ok });
+});
+
+// Public: Verify Revision OTP & Return Editable Application Data
+app.post('/api/public/revision/verify-otp', (req, res) => {
+  const trackingId = String(req.body?.trackingId || '').trim();
+  const code = String(req.body?.code || '').trim();
+  const member = getAllMembers().find(
+    (m) => m.id.toLowerCase() === trackingId.toLowerCase() && m.status === 'revision'
+  );
+  if (!member) {
+    return res.status(404).json({ error: 'Application not found or not eligible for revision.' });
+  }
+  const normPhone = normalizePhone(member.phone);
+  const row = db
+    .prepare('SELECT * FROM otp_verifications WHERE phone_normalized = ?')
+    .get(normPhone);
+
+  if (!row || Date.now() > Number(row.expires_at)) {
+    return res.status(400).json({ error: 'Verification code expired or missing. Please request a new code.' });
+  }
+  if (Number(row.attempts) >= 5) {
+    return res.status(429).json({ error: 'Too many attempts. Please request a new code.' });
+  }
+  if (row.code !== code) {
+    db.prepare('UPDATE otp_verifications SET attempts = attempts + 1 WHERE phone_normalized = ?').run(
+      normPhone
+    );
+    return res.status(400).json({ error: 'Invalid verification code.' });
+  }
+
+  db.prepare('UPDATE otp_verifications SET verified = 1 WHERE phone_normalized = ?').run(normPhone);
+  const revisionToken = createToken({ id: member.id, phone: normPhone, purpose: 'revision_edit' });
+  res.json({ verified: true, revisionToken, member });
+});
+
+// Public: Resubmit Revised Application (OTP Token Verified)
+app.put('/api/public/revision/resubmit', (req, res) => {
+  const { revisionToken, updates } = req.body || {};
+  const decoded = verifyToken(revisionToken || '');
+  if (!decoded || decoded.purpose !== 'revision_edit') {
+    return res.status(403).json({ error: 'OTP verification is required to resubmit this application.' });
+  }
+
+  const existing = getAllMembers().find((m) => m.id === decoded.id);
+  if (!existing || existing.status !== 'revision') {
+    return res.status(404).json({ error: 'Revision application not found.' });
+  }
+
+  const updated = {
+    ...existing,
+    ...updates,
+    id: existing.id,
+    memberId: existing.memberId,
+    status: 'pending',
+    submittedAt: new Date().toISOString().slice(0, 10),
+    remarks: `Resubmitted after revision (Previous note: ${existing.remarks || 'N/A'})`,
+  };
+
+  upsertMember(updated);
+  addAuditLog(
+    'APPLICATION_RESUBMITTED',
+    `Applicant ${updated.fullName} (${updated.id}) resubmitted revised application`,
+    'Public Applicant'
+  );
+
+  if (updated.phone) {
+    dispatchSms({
+      to: updated.phone,
+      recipientName: updated.fullName,
+      triggerType: 'AUTO_RESUBMIT',
+      message: `Dear ${updated.fullName}, your revised Armanitolians Club application (${updated.id}) has been resubmitted for committee review. Thank you.`,
+    }).catch(() => {});
+  }
+
+  res.json({ member: updated });
 });
 
 // Public Approved Member Payment Lookup (Requires BOTH Club ID AND Phone Number)
@@ -632,11 +743,44 @@ app.get('/api/admin/bootstrap', requireAdmin, (_req, res) => {
   });
 });
 
-// Admin: Send Manual or Bulk SMS via GreenWeb
+// Admin: Send Manual, Personalized Template, or Bulk SMS via GreenWeb
 app.post('/api/admin/sms/send', requireAdmin, async (req, res) => {
   const { recipients, message } = req.body || {};
   if (!Array.isArray(recipients) || recipients.length === 0 || !String(message || '').trim()) {
     return res.status(400).json({ error: 'Recipients and message text are required.' });
+  }
+
+  const rawMsg = String(message).trim();
+  const isPersonalized = rawMsg.includes('{Name}');
+
+  let okCount = 0;
+  let lastProviderResp = '';
+
+  if (isPersonalized && recipients.length > 1) {
+    for (const r of recipients) {
+      if (!r.phone) continue;
+      const personalMsg = rawMsg.replaceAll('{Name}', r.name || 'Member');
+      const result = await dispatchSms({
+        to: r.phone,
+        recipientName: r.name || r.phone,
+        triggerType: 'ADMIN_NOTIFICATION',
+        message: personalMsg,
+      });
+      if (result.ok) okCount++;
+      lastProviderResp = result.providerResponse;
+    }
+    addAuditLog(
+      'SMS_SENT',
+      `Admin sent personalized notification SMS to ${recipients.length} members (${okCount} delivered)`,
+      req.admin.username
+    );
+    return res.json({
+      ok: okCount > 0,
+      deliveredCount: okCount,
+      totalCount: recipients.length,
+      providerResponse: lastProviderResp,
+      smsLogs: getSmsLogs(),
+    });
   }
 
   const phones = recipients.map((r) => r.phone).filter(Boolean);
@@ -644,12 +788,16 @@ app.post('/api/admin/sms/send', requireAdmin, async (req, res) => {
     recipients.length === 1
       ? recipients[0].name || recipients[0].phone
       : `${recipients.length} Members`;
+  const finalMsg =
+    recipients.length === 1
+      ? rawMsg.replaceAll('{Name}', recipients[0].name || 'Member')
+      : rawMsg;
 
   const result = await dispatchSms({
     to: phones,
     recipientName: names,
     triggerType: recipients.length > 1 ? 'ADMIN_BULK' : 'ADMIN_MANUAL',
-    message: String(message).trim(),
+    message: finalMsg,
   });
 
   addAuditLog(

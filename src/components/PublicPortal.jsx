@@ -31,6 +31,59 @@ export default function PublicPortal() {
   const [trackedApp, setTrackedApp] = useState(null);
   const [trackError, setTrackError] = useState('');
 
+  // Revision OTP & Edit State
+  const [revOtpSent, setRevOtpSent] = useState(false);
+  const [revOtpCode, setRevOtpCode] = useState('');
+  const [revOtpMasked, setRevOtpMasked] = useState('');
+  const [revOtpLoading, setRevOtpLoading] = useState(false);
+  const [revOtpError, setRevOtpError] = useState('');
+  const [revisionSession, setRevisionSession] = useState(null); // { member, token }
+
+  const handleSendRevisionOtp = async () => {
+    if (!trackedApp?.id) return;
+    setRevOtpError('');
+    setRevOtpLoading(true);
+    try {
+      const res = await apiRequest('/api/public/revision/send-otp', {
+        method: 'POST',
+        body: JSON.stringify({ trackingId: trackedApp.id }),
+      });
+      setRevOtpSent(true);
+      setRevOtpMasked(res.maskedPhone || trackedApp.phoneMasked || '');
+      setRevOtpCode('');
+      showToast(
+        lang === 'bn'
+          ? `আপনার মোবাইলে (${res.maskedPhone}) ৬ ডিজিটের কোড পাঠানো হয়েছে।`
+          : `6-digit verification code sent to ${res.maskedPhone}.`,
+        'success'
+      );
+    } catch (err) {
+      setRevOtpError(err.message);
+    } finally {
+      setRevOtpLoading(false);
+    }
+  };
+
+  const handleVerifyRevisionOtp = async (e) => {
+    e.preventDefault();
+    if (!trackedApp?.id || revOtpCode.trim().length !== 6) return;
+    setRevOtpError('');
+    setRevOtpLoading(true);
+    try {
+      const res = await apiRequest('/api/public/revision/verify-otp', {
+        method: 'POST',
+        body: JSON.stringify({ trackingId: trackedApp.id, code: revOtpCode.trim() }),
+      });
+      setRevisionSession({ member: res.member, token: res.revisionToken });
+      setRevOtpSent(false);
+      setRevOtpCode('');
+    } catch (err) {
+      setRevOtpError(err.message);
+    } finally {
+      setRevOtpLoading(false);
+    }
+  };
+
   const [clubId, setClubId] = useState('');
   const [phone, setPhone] = useState('');
   const [payLoading, setPayLoading] = useState(false);
@@ -238,44 +291,44 @@ export default function PublicPortal() {
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F3F5F7] text-[#1A202C]">
-      {/* Official Institutional White Header (Consular Portal Theme) */}
+      {/* Official Institutional White Header (Fully Responsive Mobile View) */}
       <header className="sticky top-0 z-30 bg-white border-b border-slate-200 no-print">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
+        <div className="max-w-6xl mx-auto px-3 sm:px-6 lg:px-8 min-h-16 py-2 flex items-center justify-between gap-2 sm:gap-4">
           <button
             onClick={() => setRoute('home')}
-            className="flex items-center gap-3 text-left group"
+            className="flex items-center gap-2 sm:gap-3 text-left min-w-0"
           >
-            <div className="flex items-center gap-2.5">
-              <div className="w-9 h-9 rounded flex items-center justify-center bg-[#004B76] text-white shrink-0">
-                <Award className="w-5 h-5" />
+            <div className="flex items-center gap-2 shrink-0">
+              <div className="w-8 h-8 sm:w-9 sm:h-9 rounded flex items-center justify-center bg-[#004B76] text-white shrink-0">
+                <Award className="w-4 h-4 sm:w-5 sm:h-5" />
               </div>
-              <span className="h-8 w-[3px] bg-gradient-to-b from-[#002B45] via-[#C8102E] to-[#D4A017] rounded-full" />
+              <span className="h-7 sm:h-8 w-[3px] bg-gradient-to-b from-[#002B45] via-[#C8102E] to-[#D4A017] rounded-full" />
             </div>
-            <div className="flex flex-col sm:flex-row sm:items-baseline sm:gap-2.5">
-              <span className="font-bold text-sm sm:text-base text-slate-900 tracking-tight">
+            <div className="flex flex-col sm:flex-row sm:items-baseline sm:gap-2.5 min-w-0">
+              <span className="font-bold text-xs sm:text-base text-slate-900 tracking-tight truncate">
                 {clubName}
               </span>
-              <span className="text-xs sm:text-sm text-slate-500 font-normal">
+              <span className="text-[11px] sm:text-sm text-slate-500 font-normal truncate">
                 {portalSubtitle}
               </span>
             </div>
           </button>
 
           {/* Clean Underlined Utility Links */}
-          <div className="flex items-center gap-4 sm:gap-6 text-xs sm:text-sm text-slate-700">
+          <div className="flex items-center gap-3 sm:gap-6 text-xs sm:text-sm text-slate-700 shrink-0">
             <button
               onClick={() => setLang(lang === 'en' ? 'bn' : 'en')}
-              className="inline-flex items-center gap-1.5 hover:text-[#004B76] transition-colors"
+              className="inline-flex items-center gap-1 hover:text-[#004B76] transition-colors"
             >
               <span className="underline underline-offset-4">
                 {lang === 'en' ? 'বাংলা' : 'English'}
               </span>
-              <Globe className="w-4 h-4 text-slate-600" />
+              <Globe className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-600" />
             </button>
 
             <a
               href={`mailto:${settings.contactEmail}`}
-              className="hidden sm:inline-flex items-center gap-1.5 hover:text-[#004B76] transition-colors"
+              className="hidden md:inline-flex items-center gap-1.5 hover:text-[#004B76] transition-colors"
             >
               <span className="underline underline-offset-4">
                 {lang === 'bn' ? 'যোগাযোগ' : 'Contact'}
@@ -285,36 +338,31 @@ export default function PublicPortal() {
 
             <button
               onClick={() => setRoute('admin')}
-              className="inline-flex items-center gap-1.5 hover:text-[#004B76] transition-colors"
+              className="inline-flex items-center gap-1 hover:text-[#004B76] transition-colors"
             >
               <span className="underline underline-offset-4">
-                {lang === 'bn' ? 'অ্যাডমিন' : 'Account'}
+                {lang === 'bn' ? 'অ্যাডমিন' : 'Admin'}
               </span>
-              <User className="w-4 h-4 text-slate-600" />
+              <User className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-600" />
             </button>
           </div>
         </div>
       </header>
 
       {/* MAIN BODY */}
-      <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-10 sm:py-14">
+      <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-14">
         {/* DEFAULT HOME VIEW (Official Institutional Portal Cards) */}
         {route === 'home' && (
           <div className="space-y-8">
             <div className="max-w-3xl space-y-2.5">
-              <h1 className="text-xl sm:text-2xl font-bold text-[#004B76] flex items-center gap-2.5">
-                <span className="w-6 h-6 rounded-full bg-[#004B76] text-white inline-flex items-center justify-center text-xs shrink-0">
-                  ✓
-                </span>
-                <span>
-                  {lang === 'bn'
-                    ? 'সদস্য নিবন্ধন, আবেদন পর্যবেক্ষণ এবং সাবস্ক্রিপশন পেমেন্ট পোর্টাল'
-                    : 'Membership registration, application tracking and subscription payments'}
-                </span>
+              <h1 className="text-xl sm:text-2xl font-bold text-[#004B76] leading-snug">
+                {lang === 'bn'
+                  ? 'সদস্য সেবা পোর্টাল: নিবন্ধন, আবেদন ট্র্যাকিং, পেমেন্ট'
+                  : 'Member Service Portal: Registration, Application Tracking, Payments'}
               </h1>
               <p className="text-sm text-slate-600 leading-relaxed">
                 {lang === 'bn'
-                  ? 'আরমানিটোলিয়ান ক্লাবের সদস্যপদের জন্য অনলাইনে আবেদন জমা দিন, আপনার আবেদনের বর্তমান অবস্থা যাচাই করুন এবং অনুমোদিত সদস্যরা নির্ধারিত কিস্তি পরিশোধ করুন।'
+                  ? 'দ্য আরমানিটোলিয়ানস ক্লাবের সদস্যপদের জন্য অনলাইনে আবেদন জমা দিন, আপনার আবেদনের বর্তমান অবস্থা যাচাই করুন এবং অনুমোদিত সদস্যরা নির্ধারিত কিস্তি পরিশোধ করুন।'
                   : 'Submit your official membership application with supporting documents, track committee review status, or manage and pay your monthly subscription installments.'}
               </p>
             </div>
@@ -546,6 +594,76 @@ export default function PublicPortal() {
                         <strong>Committee Remarks:</strong> {trackedApp.remarks}
                       </div>
                     )}
+
+                    {/* Revision Edit with OTP Verification */}
+                    {trackedApp.status === 'revision' && !revisionSession && (
+                      <div className="pt-4 border-t border-slate-100 space-y-3">
+                        {!revOtpSent ? (
+                          <button
+                            type="button"
+                            disabled={revOtpLoading}
+                            onClick={handleSendRevisionOtp}
+                            className="w-full sm:w-auto px-5 py-2.5 rounded-full bg-[#004B76] hover:bg-[#003B5C] text-white text-xs font-semibold inline-flex items-center justify-center gap-2"
+                          >
+                            <Lock className="w-3.5 h-3.5" />
+                            {revOtpLoading
+                              ? lang === 'bn'
+                                ? 'কোড পাঠানো হচ্ছে...'
+                                : 'Sending OTP...'
+                              : lang === 'bn'
+                              ? 'OTP যাচাই করে তথ্য সংশোধন করুন'
+                              : 'Edit & Resubmit Application (Verify via OTP)'}
+                          </button>
+                        ) : (
+                          <form
+                            onSubmit={handleVerifyRevisionOtp}
+                            className="p-4 bg-[#F1F4F6] space-y-3"
+                          >
+                            <p className="text-xs font-semibold text-slate-700">
+                              {lang === 'bn'
+                                ? `আপনার মোবাইলে (${revOtpMasked}) পাঠানো ৬ ডিজিটের কোড দিন:`
+                                : `Enter the 6-digit SMS code sent to ${revOtpMasked}:`}
+                            </p>
+                            <div className="flex flex-col sm:flex-row gap-2.5">
+                              <input
+                                type="text"
+                                inputMode="numeric"
+                                maxLength={6}
+                                required
+                                value={revOtpCode}
+                                onChange={(e) => setRevOtpCode(e.target.value.replace(/\D/g, ''))}
+                                placeholder="6-digit code"
+                                className="flex-1 px-4 py-2 rounded border border-slate-300 bg-white font-mono text-center text-base tracking-widest"
+                              />
+                              <button
+                                type="submit"
+                                disabled={revOtpLoading || revOtpCode.length !== 6}
+                                className="px-5 py-2 rounded-full bg-[#004B76] hover:bg-[#003B5C] text-white text-xs font-semibold disabled:opacity-40"
+                              >
+                                {revOtpLoading ? 'Verifying...' : 'Verify & Open Form'}
+                              </button>
+                            </div>
+                            {revOtpError && (
+                              <p className="text-xs font-semibold text-rose-700">{revOtpError}</p>
+                            )}
+                          </form>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {revisionSession && (
+                  <div className="pt-2">
+                    <RegistrationForm
+                      isPublic
+                      revisionData={revisionSession.member}
+                      revisionToken={revisionSession.token}
+                      onRevisionSuccess={() => {
+                        setRevisionSession(null);
+                        setTrackedApp((prev) => (prev ? { ...prev, status: 'pending' } : prev));
+                      }}
+                    />
                   </div>
                 )}
               </div>
@@ -858,13 +976,16 @@ export default function PublicPortal() {
         )}
       </main>
 
-      {/* Clean Institutional Footer */}
+      {/* Clean Institutional Responsive Footer */}
       <footer className="bg-white border-t border-slate-200 py-5 text-xs text-slate-500 no-print">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-2">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-2 text-center sm:text-left">
           <span>
             © {new Date().getFullYear()} {clubName} · {settings.clubAddress}
           </span>
-          <span>{settings.contactPhone} · {settings.contactEmail}</span>
+          <span className="break-all">
+            {settings.contactPhone} · {settings.contactEmail}
+            {settings.clubWebpage ? ` · ${settings.clubWebpage}` : ''}
+          </span>
         </div>
       </footer>
 
