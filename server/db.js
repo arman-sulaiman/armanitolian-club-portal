@@ -9,7 +9,20 @@ import {
   initialPayments,
 } from '../src/data/seedData.js';
 
-const PG_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL || '';
+const PG_URL =
+  process.env.DATABASE_URL ||
+  process.env.POSTGRES_URL ||
+  process.env.POSTGRES_PRISMA_URL ||
+  process.env.DATABASE_URL_UNPOOLED ||
+  process.env.POSTGRES_URL_NON_POOLING ||
+  process.env.STORAGE_URL ||
+  process.env.STORAGE_DATABASE_URL ||
+  process.env.STORAGE_POSTGRES_URL ||
+  Object.entries(process.env).find(
+    ([k, v]) =>
+      /postgres|neon|database|storage/i.test(k) && /^postgres(ql)?:\/\//i.test(String(v || ''))
+  )?.[1] ||
+  '';
 export const isPostgres = Boolean(PG_URL);
 
 let pgPool = null;
