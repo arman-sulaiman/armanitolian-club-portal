@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   MessageSquare,
   Send,
@@ -8,11 +8,59 @@ import {
   AlertCircle,
   Clock,
   FileText,
+  BellRing,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import { apiRequest } from '../utils/api';
 
 export default function SmsCenter() {
-  const { lang, members, plans, smsLogs, smsSenderId, sendAdminSms, showToast } = useApp();
+  const { lang, members, plans, smsLogs, smsSenderId, sendAdminSms, reloadAdmin, showToast } = useApp();
+  const [sectionTab, setSectionTab] = useState('notifications'); // 'notifications' | 'dues'
+
+  // Due Reminder State (7th day at 4:00 PM BST + Manual Trigger)
+  const [dueMonth, setDueMonth] = useState('2027-01');
+  const [duePreview, setDuePreview] = useState({ overdue: [], totalOverdueAmount: 0 });
+  const [loadingDue, setLoadingDue] = useState(false);
+  const [sendingDue, setSendingDue] = useState(false);
+
+  const fetchDuePreview = async (m = dueMonth) => {
+    setLoadingDue(true);
+    try {
+      const res = await apiRequest(`/api/admin/dues/preview?month=${encodeURIComponent(m)}`);
+      setDuePreview(res);
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setLoadingDue(false);
+    }
+  };
+
+  useEffect(() => {
+    if (sectionTab === 'dues') {
+      fetchDuePreview(dueMonth);
+    }
+  }, [sectionTab, dueMonth]);
+
+  const handleSendDueReminders = async () => {
+    setSendingDue(true);
+    try {
+      const res = await apiRequest('/api/admin/dues/send-reminders', {
+        method: 'POST',
+        body: JSON.stringify({ month: dueMonth }),
+      });
+      await reloadAdmin();
+      showToast(
+        lang === 'bn'
+          ? `${res.sentCount}/${res.totalCount} জন বকেয়া সদস্যকে রিমাইন্ডার এসএমএস পাঠানো হয়েছে।`
+          : `Due Reminder SMS dispatched to ${res.sentCount}/${res.totalCount} overdue member(s).`,
+        'success'
+      );
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setSendingDue(false);
+    }
+  };
 
   // Audience mode: 'single' | 'categorized'
   const [audienceMode, setAudienceMode] = useState('categorized');
@@ -183,7 +231,117 @@ export default function SmsCenter() {
         </span>
       </div>
 
+      {/* Section Switcher: Notifications vs Due Reminders */}
+      <div className="inline-flex rounded-full bg-white border border-slate-200 p-1">
+        <button
+          type="button"
+          onClick={() => setSectionTab('notifications')}
+          className={`px-4 py-1.5 rounded-full text-xs font-semibold transition-all ${
+            sectionTab === 'notifications' ? 'bg-[#004B76] text-white' : 'text-slate-600'
+          }`}
+        >
+          {lang === 'bn' ? 'নোটিফিকেশন ও মিটিং এসএমএস' : 'Send Notifications & Meetings'}
+        </button>
+        <button
+          type="button"
+          onClick={() => setSectionTab('dues')}
+          className={`inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full text-xs font-semibold transition-all ${
+            sectionTab === 'dues' ? 'bg-[#004B76] text-white' : 'text-slate-600'
+          }`}
+        >
+          <BellRing className="w-3.5 h-3.5" />
+          {lang === 'bn' ? 'বকেয়া রিমাইন্ডার (৭ তারিখ বিকাল ৪টা)' : 'Send Due Reminder (7th · 4 PM)'}
+        </button>
+      </div>
+
+      {/* DUE REMINDER PANEL */}
+      {sectionTab === 'dues' && (
+        <div className="bg-white border border-slate-200 p-5 sm:p-6 space-y-5">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-100">
+            <div>
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded bg-[#EBF4FA] text-[#004B76] text-[11px] font-bold">
+                <Clock className="w-3.5 h-3.5" />
+                Auto-Scheduled: Every Month 7th Day at 4:00 PM (BST)
+              </span>
+              <h2 className="text-base font-bold text-slate-900 mt-2">
+                {lang === 'bn' ? 'বকেয়া চাঁদা রিমাইন্ডার এসএমএস' : 'Past Dues SMS Reminder'}
+              </h2>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Channel: <strong>GreenWeb SMS</strong> ·{' '}
+                <span className="text-slate-400">WhatsApp channel architecture ready for future activation</span>
+              </p>
+            </div>
+            <div className="flex items-center gap-2.5 shrink-0">
+              <input
+                type="month"
+                value={dueMonth}
+                onChange={(e) => setDueMonth(e.target.value)}
+                className="px-3 py-2 rounded border border-slate-300 text-sm font-semibold"
+              />
+              <button
+                type="button"
+                disabled={sendingDue || (duePreview.overdue || []).length === 0}
+                onClick={handleSendDueReminders}
+                className="px-5 py-2.5 rounded-full bg-[#004B76] hover:bg-[#003B5C] text-white text-xs font-semibold inline-flex items-center gap-1.5 disabled:opacity-40"
+              >
+                <Send className="w-3.5 h-3.5" />
+                {sendingDue
+                  ? 'Sending...'
+                  : `Send Now (${(duePreview.overdue || []).length})`}
+              </button>
+            </div>
+          </div>
+
+          <div className="p-4 bg-[#F1F4F6] border border-slate-200 text-sm text-slate-800 whitespace-pre-line leading-relaxed">
+            <p className="text-[11px] font-bold uppercase tracking-wider text-[#004B76] mb-1">
+              Bangla Due Reminder Template
+            </p>
+            {`প্রিয় সদস্য, আমাদের রেকর্ড অনুযায়ী আপনার মাসিক চাঁদা এখনো বকেয়া রয়েছে। অনুগ্রহ করে বকেয়া পেমেন্টঃ {Amount} টাকা পরিশোধ করুন। উল্লেখ্য, প্রতি মাসের ১০ তারিখের মধ্যে মাসিক পেমেন্ট/ইনস্টলমেন্ট পরিশোধ করার অনুরোধ রইল।\nধন্যবাদান্তে,\nআরমানিটোলিয়ান্স ক্লাব`}
+          </div>
+
+          {loadingDue ? (
+            <p className="text-xs text-slate-500">Loading overdue members...</p>
+          ) : (duePreview.overdue || []).length === 0 ? (
+            <p className="text-sm text-emerald-700 font-semibold">
+              No overdue members found up to {dueMonth}.
+            </p>
+          ) : (
+            <div className="overflow-x-auto border border-slate-200">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-[#F3F5F7] border-b border-slate-200 text-slate-600 uppercase">
+                  <tr>
+                    <th className="px-4 py-2.5">Club ID</th>
+                    <th className="px-4 py-2.5">Member</th>
+                    <th className="px-4 py-2.5">Phone</th>
+                    <th className="px-4 py-2.5 text-center">Missed</th>
+                    <th className="px-4 py-2.5 text-right">Due Amount</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {duePreview.overdue.map((item) => (
+                    <tr key={item.memberId}>
+                      <td className="px-4 py-2.5 font-mono font-semibold text-[#004B76]">
+                        {item.memberId}
+                      </td>
+                      <td className="px-4 py-2.5 font-semibold text-slate-900">
+                        {item.name} (SSC {item.batch})
+                      </td>
+                      <td className="px-4 py-2.5 font-mono text-slate-600">{item.phone}</td>
+                      <td className="px-4 py-2.5 text-center font-bold">{item.missedCount}</td>
+                      <td className="px-4 py-2.5 text-right font-bold text-rose-700 tabular-nums">
+                        ৳{Number(item.dueAmount).toLocaleString()}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Compose Card */}
+      {sectionTab === 'notifications' && (
       <form onSubmit={handleSend} className="bg-white border border-slate-200 p-5 sm:p-6 space-y-6">
         {/* Step 1: Audience Selection */}
         <div className="space-y-4 pb-5 border-b border-slate-100">
@@ -480,6 +638,7 @@ export default function SmsCenter() {
           </button>
         </div>
       </form>
+      )}
 
       {/* SMS Logs Table */}
       <div className="bg-white border border-slate-200 overflow-hidden">

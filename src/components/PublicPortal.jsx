@@ -16,14 +16,19 @@ import {
   Lock,
   ExternalLink,
   Mail,
+  Megaphone,
+  Download,
+  Eye,
+  Calendar,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { apiRequest } from '../utils/api';
 import { generateMemberSchedule, formatMonthLabel } from '../utils/subscriptionEngine';
+import { buildMemberProgressPdf } from '../utils/reportPdfGenerator';
 import RegistrationForm from './RegistrationForm';
 
 export default function PublicPortal() {
-  const { lang, setLang, route, setRoute, settings, showToast, toast } = useApp();
+  const { lang, setLang, route, setRoute, settings, notices, showToast, toast } = useApp();
   const [portalTab, setPortalTab] = useState('payments'); // 'track' | 'payments'
 
   const [trackQuery, setTrackQuery] = useState('');
@@ -94,6 +99,68 @@ export default function PublicPortal() {
 
   const [spOrder, setSpOrder] = useState(null);
   const [spProcessing, setSpProcessing] = useState(false);
+
+  // Membership Fee Progress Report (OTP Verified) State
+  const [progOtpSent, setProgOtpSent] = useState(false);
+  const [progOtpCode, setProgOtpCode] = useState('');
+  const [progOtpMasked, setProgOtpMasked] = useState('');
+  const [progLoading, setProgLoading] = useState(false);
+  const [progError, setProgError] = useState('');
+  const [progPdf, setProgPdf] = useState(null); // { blobUrl, fileName }
+
+  const handleSendProgressOtp = async () => {
+    if (!clubId.trim() || !phone.trim()) {
+      setProgError('Please enter both Club Member ID and Phone Number above first.');
+      return;
+    }
+    setProgError('');
+    setProgPdf(null);
+    setProgLoading(true);
+    try {
+      const res = await apiRequest('/api/public/progress-report/send-otp', {
+        method: 'POST',
+        body: JSON.stringify({ clubId, phone }),
+      });
+      setProgOtpSent(true);
+      setProgOtpMasked(res.maskedPhone || phone);
+      setProgOtpCode('');
+      showToast(
+        lang === 'bn'
+          ? `ফি প্রোগ্রেস রিপোর্টের জন্য OTP (${res.maskedPhone}) পাঠানো হয়েছে।`
+          : `6-digit OTP sent to ${res.maskedPhone} for Fee Progress Report.`,
+        'success'
+      );
+    } catch (err) {
+      setProgError(err.message);
+    } finally {
+      setProgLoading(false);
+    }
+  };
+
+  const handleVerifyProgressOtp = async (e) => {
+    e.preventDefault();
+    if (progOtpCode.trim().length !== 6) return;
+    setProgError('');
+    setProgLoading(true);
+    try {
+      const res = await apiRequest('/api/public/progress-report/verify-otp', {
+        method: 'POST',
+        body: JSON.stringify({ clubId, phone, code: progOtpCode.trim() }),
+      });
+      const built = buildMemberProgressPdf(res.report);
+      setProgPdf(built);
+      setProgOtpSent(false);
+      setProgOtpCode('');
+      showToast(
+        lang === 'bn' ? 'ফি প্রোগ্রেস রিপোর্ট পিডিএফ প্রস্তুত!' : 'Fee Progress Report PDF is ready!',
+        'success'
+      );
+    } catch (err) {
+      setProgError(err.message);
+    } finally {
+      setProgLoading(false);
+    }
+  };
 
   const clubName = lang === 'bn' ? settings.clubNameBn : settings.clubNameEn;
   const portalSubtitle = lang === 'bn' ? 'সদস্য সেবা পোর্টাল' : 'Member Services Portal';
@@ -337,6 +404,16 @@ export default function PublicPortal() {
             </a>
 
             <button
+              onClick={() => setRoute('notices')}
+              className="inline-flex items-center gap-1 hover:text-[#004B76] transition-colors"
+            >
+              <span className="underline underline-offset-4">
+                {lang === 'bn' ? 'নোটিশ' : 'Notices'}
+              </span>
+              <Megaphone className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-600" />
+            </button>
+
+            <button
               onClick={() => setRoute('admin')}
               className="inline-flex items-center gap-1 hover:text-[#004B76] transition-colors"
             >
@@ -368,7 +445,7 @@ export default function PublicPortal() {
             </div>
 
             {/* Clean White Institutional Portal Cards */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 max-w-4xl">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
               {/* Card 1: Member Registration */}
               <div className="bg-white border border-slate-200/90 p-7 sm:p-8 flex flex-col justify-between min-h-[300px] shadow-[0_1px_2px_rgba(0,0,0,0.03)]">
                 <div>
@@ -449,7 +526,105 @@ export default function PublicPortal() {
                   </div>
                 </div>
               </div>
+
+              {/* Card 3: Notices & Press Releases */}
+              <div className="bg-white border border-slate-200/90 p-7 sm:p-8 flex flex-col justify-between min-h-[300px] shadow-[0_1px_2px_rgba(0,0,0,0.03)]">
+                <div>
+                  <div className="flex items-start justify-between gap-4">
+                    <h2 className="text-lg font-bold text-slate-900">
+                      {lang === 'bn' ? 'নোটিশ ও প্রেস রিলিজ' : 'Notices & press releases'}
+                    </h2>
+                    <Megaphone className="w-6 h-6 text-[#004B76] shrink-0" />
+                  </div>
+                  <p className="text-sm text-slate-600 mt-4 leading-relaxed">
+                    {lang === 'bn'
+                      ? 'ক্লাবের সর্বশেষ অফিশিয়াল বিজ্ঞপ্তি, সভার নোটিশ এবং প্রেস রিলিজ ও সংযুক্ত নথি দেখুন।'
+                      : 'Read official club announcements, executive press releases, and downloadable PDF/Image circulars.'}
+                  </p>
+                </div>
+
+                <div className="pt-8 space-y-3">
+                  <div className="flex items-baseline justify-between text-xs text-slate-500">
+                    <span>{lang === 'bn' ? 'প্রকাশিত নোটিশ' : 'Published notices'}</span>
+                    <span className="text-2xl font-bold text-[#004B76] tabular-nums">
+                      {(notices || []).length}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => setRoute('notices')}
+                    className="w-full py-2.5 px-5 rounded-full border border-[#004B76] text-[#004B76] hover:bg-[#EBF4FA] text-sm font-semibold transition-colors"
+                  >
+                    {lang === 'bn' ? 'সকল নোটিশ দেখুন' : 'View notices'}
+                  </button>
+                </div>
+              </div>
             </div>
+          </div>
+        )}
+
+        {/* PUBLIC NOTICES & PRESS RELEASES VIEW */}
+        {route === 'notices' && (
+          <div className="space-y-6">
+            <div className="border-b border-slate-200 pb-4">
+              <button
+                onClick={() => setRoute('home')}
+                className="text-xs font-semibold text-[#004B76] underline underline-offset-4 mb-2 block"
+              >
+                ← {lang === 'bn' ? 'পোর্টালে ফিরে যান' : 'Back to portal overview'}
+              </button>
+              <h1 className="text-xl sm:text-2xl font-bold text-[#004B76]">
+                {lang === 'bn' ? 'অফিশিয়াল নোটিশ ও প্রেস রিলিজ' : 'Official Notices & Press Releases'}
+              </h1>
+            </div>
+
+            {(notices || []).length === 0 ? (
+              <div className="bg-white border border-slate-200 p-10 text-center text-sm text-slate-500">
+                No notices published yet.
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {notices.map((n) => (
+                  <article key={n.id} className="bg-white border border-slate-200 p-6 space-y-3">
+                    <div className="flex items-center gap-2 text-xs text-slate-500">
+                      <Calendar className="w-3.5 h-3.5 text-[#004B76]" />
+                      <span className="font-mono font-semibold">{n.date}</span>
+                    </div>
+                    <h2 className="text-lg font-bold text-slate-900">{n.title}</h2>
+                    <p className="text-sm text-slate-600 whitespace-pre-line leading-relaxed">
+                      {n.description}
+                    </p>
+                    {n.attachment_data && (
+                      <div className="pt-3 border-t border-slate-100">
+                        {String(n.attachment_type || '').startsWith('image/') ? (
+                          <div className="space-y-2">
+                            <img
+                              src={n.attachment_data}
+                              alt={n.attachment_name || n.title}
+                              className="max-h-96 rounded border border-slate-200 object-contain bg-slate-50"
+                            />
+                            <a
+                              href={n.attachment_data}
+                              download={n.attachment_name || 'notice-image.png'}
+                              className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#004B76] underline"
+                            >
+                              <Download className="w-3.5 h-3.5" /> Download Image ({n.attachment_name})
+                            </a>
+                          </div>
+                        ) : (
+                          <a
+                            href={n.attachment_data}
+                            download={n.attachment_name || 'notice.pdf'}
+                            className="inline-flex items-center gap-2 px-4 py-2 rounded-full border border-[#004B76] text-[#004B76] hover:bg-[#EBF4FA] text-xs font-semibold"
+                          >
+                            <Download className="w-3.5 h-3.5" /> Download Attachment ({n.attachment_name})
+                          </a>
+                        )}
+                      </div>
+                    )}
+                  </article>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
@@ -873,16 +1048,91 @@ export default function PublicPortal() {
                         </div>
                       </div>
 
-                      <div className="mt-5 pt-4 border-t border-slate-100 flex items-center justify-between text-xs text-slate-600">
+                      <div className="mt-5 pt-4 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-slate-600">
                         <span>
                           {lang === 'bn'
                             ? 'ক্রমানুসারে শুধুমাত্র সর্বশেষ বকেয়া মাসের পেমেন্ট সক্রিয় রয়েছে।'
                             : 'Sequential billing: only the current earliest unpaid month is enabled for payment.'}
                         </span>
-                        <span className="font-bold text-[#004B76] tabular-nums">
-                          {paidCount} / {totalSteps}
-                        </span>
+                        <div className="flex flex-wrap items-center gap-3">
+                          <span className="font-bold text-[#004B76] tabular-nums">
+                            {paidCount} / {totalSteps}
+                          </span>
+                          <button
+                            type="button"
+                            disabled={progLoading}
+                            onClick={handleSendProgressOtp}
+                            className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full border border-[#004B76] text-[#004B76] hover:bg-[#EBF4FA] text-xs font-semibold"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            {progLoading
+                              ? 'Sending OTP...'
+                              : lang === 'bn'
+                              ? 'ফি প্রোগ্রেস রিপোর্ট (OTP)'
+                              : 'Fee Progress Report PDF (OTP)'}
+                          </button>
+                        </div>
                       </div>
+
+                      {/* OTP Box for Membership Fee Progress Report PDF */}
+                      {progOtpSent && (
+                        <form
+                          onSubmit={handleVerifyProgressOtp}
+                          className="mt-4 p-4 bg-[#F1F4F6] border border-slate-200 space-y-3"
+                        >
+                          <p className="text-xs font-semibold text-slate-700">
+                            {lang === 'bn'
+                              ? `ফি প্রোগ্রেস রিপোর্ট ডাউনলোড করতে ${progOtpMasked} নম্বরে পাঠানো ৬ ডিজিটের OTP দিন:`
+                              : `Enter the 6-digit SMS OTP sent to ${progOtpMasked} to generate your Membership Fee Progress Report PDF:`}
+                          </p>
+                          <div className="flex flex-col sm:flex-row gap-2.5">
+                            <input
+                              type="text"
+                              inputMode="numeric"
+                              maxLength={6}
+                              required
+                              value={progOtpCode}
+                              onChange={(e) => setProgOtpCode(e.target.value.replace(/\D/g, ''))}
+                              placeholder="6-digit OTP"
+                              className="flex-1 px-4 py-2 rounded border border-slate-300 bg-white font-mono text-center tracking-widest"
+                            />
+                            <button
+                              type="submit"
+                              disabled={progLoading || progOtpCode.length !== 6}
+                              className="px-5 py-2 rounded-full bg-[#004B76] hover:bg-[#003B5C] text-white text-xs font-semibold disabled:opacity-40"
+                            >
+                              {progLoading ? 'Verifying...' : 'Verify & Generate PDF'}
+                            </button>
+                          </div>
+                          {progError && <p className="text-xs font-semibold text-rose-700">{progError}</p>}
+                        </form>
+                      )}
+
+                      {progPdf && (
+                        <div className="mt-4 p-4 bg-emerald-50 border border-emerald-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                          <span className="text-xs font-bold text-emerald-900 flex items-center gap-1.5">
+                            <CheckCircle2 className="w-4 h-4 text-emerald-700" />
+                            {progPdf.fileName}
+                          </span>
+                          <div className="flex items-center gap-2">
+                            <a
+                              href={progPdf.blobUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 px-4 py-1.5 rounded-full border border-[#004B76] text-[#004B76] bg-white text-xs font-semibold"
+                            >
+                              <Eye className="w-3.5 h-3.5" /> View PDF
+                            </a>
+                            <a
+                              href={progPdf.blobUrl}
+                              download={progPdf.fileName}
+                              className="inline-flex items-center gap-1 px-4 py-1.5 rounded-full bg-[#004B76] text-white text-xs font-semibold"
+                            >
+                              <Download className="w-3.5 h-3.5" /> Download PDF
+                            </a>
+                          </div>
+                        </div>
+                      )}
                     </div>
 
                     {/* Installment Cards (ONLY Latest/Next Unpaid Month Enabled!) */}

@@ -12,6 +12,7 @@ function parseHashRoute() {
   if (route === 'admin') return 'admin';
   if (route === 'register') return 'register';
   if (route === 'portal') return 'portal';
+  if (route === 'notices') return 'notices';
   return 'home';
 }
 
@@ -29,6 +30,7 @@ export function AppProvider({ children }) {
   const [settings, setSettings] = useState(initialSettings);
   const [auditLogs, setAuditLogs] = useState([]);
   const [smsLogs, setSmsLogs] = useState([]);
+  const [notices, setNotices] = useState([]);
   const [smsSenderId, setSmsSenderId] = useState('8809617621831');
   const [shurjopayMode, setShurjopayMode] = useState('sandbox');
   const [loading, setLoading] = useState(true);
@@ -64,6 +66,7 @@ export function AppProvider({ children }) {
       const data = await apiRequest('/api/public/bootstrap');
       if (data.settings) setSettings(data.settings);
       if (data.plans) setPlans(data.plans);
+      if (data.notices) setNotices(data.notices);
       if (data.shurjopayMode) setShurjopayMode(data.shurjopayMode);
     } catch {
       // keep defaults if server starting
@@ -78,6 +81,7 @@ export function AppProvider({ children }) {
     setSettings(data.settings || initialSettings);
     setAuditLogs(data.auditLogs || []);
     setSmsLogs(data.smsLogs || []);
+    setNotices(data.notices || []);
     if (data.shurjopayMode) setShurjopayMode(data.shurjopayMode);
     if (data.smsSenderId) setSmsSenderId(data.smsSenderId);
   }, []);
@@ -219,6 +223,24 @@ export function AppProvider({ children }) {
     return res;
   };
 
+  const publishNotice = async (payload) => {
+    const res = await apiRequest('/api/admin/notices', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    if (res.notices) setNotices(res.notices);
+    await loadAdminBootstrap();
+    return res.notice;
+  };
+
+  const deleteNotice = async (id) => {
+    const res = await apiRequest(`/api/admin/notices/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
+    if (res.notices) setNotices(res.notices);
+    await loadAdminBootstrap();
+  };
+
   const resetDemoData = async () => {
     await apiRequest('/api/admin/reset-demo', { method: 'POST' });
     await loadAdminBootstrap();
@@ -247,8 +269,11 @@ export function AppProvider({ children }) {
         setSettings: saveSettingsToDb,
         auditLogs,
         smsLogs,
+        notices,
         smsSenderId,
         sendAdminSms,
+        publishNotice,
+        deleteNotice,
         toast,
         showToast,
         loginAdmin,

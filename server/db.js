@@ -114,6 +114,17 @@ export function initDatabase() {
       code_hash TEXT NOT NULL,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS notices (
+      id TEXT PRIMARY KEY,
+      date TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      attachment_name TEXT,
+      attachment_type TEXT,
+      attachment_data TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   seedIfEmpty();
@@ -180,6 +191,23 @@ export function seedIfEmpty(forceReset = false) {
     insertCode.run('Primary Executive Code', hashPassword('19042026'));
     insertCode.run('Finance Committee Code', hashPassword('19000212'));
     insertCode.run('Secretariat Code', hashPassword('20202026'));
+  }
+
+  // Seed initial welcome notice if empty
+  const noticeCount = db.prepare('SELECT COUNT(*) as c FROM notices').get().c;
+  if (noticeCount === 0) {
+    db.prepare(
+      `INSERT INTO notices (id, date, title, description, attachment_name, attachment_type, attachment_data)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'NTC-2026-001',
+      '2026-11-24',
+      "Welcome to The Armanitolian's Club Official Member Services Portal",
+      "Alumni of Armanitola Govt. High School can now submit membership applications online, track approval status, pay monthly installments via ShurjoPay starting January 2027, and download verified fee progress reports.",
+      null,
+      null,
+      null
+    );
   }
 
   const memberCount = db.prepare('SELECT COUNT(*) as c FROM members').get().c;
@@ -320,4 +348,27 @@ export function verifyReportAccessCode(plainCode) {
     }
   }
   return { valid: false, label: null };
+}
+
+export function getAllNotices() {
+  return db.prepare('SELECT * FROM notices ORDER BY date DESC, created_at DESC').all();
+}
+
+export function insertNotice(notice) {
+  db.prepare(
+    `INSERT INTO notices (id, date, title, description, attachment_name, attachment_type, attachment_data)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    notice.id,
+    notice.date,
+    notice.title,
+    notice.description,
+    notice.attachmentName || null,
+    notice.attachmentType || null,
+    notice.attachmentData || null
+  );
+}
+
+export function deleteNoticeById(id) {
+  db.prepare('DELETE FROM notices WHERE id = ?').run(id);
 }

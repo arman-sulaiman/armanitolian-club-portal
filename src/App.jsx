@@ -9,6 +9,7 @@ import MemberApprovals from './components/MemberApprovals';
 import MemberDirectory from './components/MemberDirectory';
 import MonthlyPayments from './components/MonthlyPayments';
 import ReportGenerator from './components/ReportGenerator';
+import NoticeManager from './components/NoticeManager';
 import SmsCenter from './components/SmsCenter';
 import AdminAuditLog from './components/AdminAuditLog';
 import SettingsPanel from './components/SettingsPanel';
@@ -46,6 +47,8 @@ function AppContent() {
         return <MonthlyPayments />;
       case 'reports':
         return <ReportGenerator />;
+      case 'notices':
+        return <NoticeManager />;
       case 'sms':
         return <SmsCenter />;
       case 'audit':

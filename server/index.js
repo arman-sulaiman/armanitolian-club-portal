@@ -23,6 +23,9 @@ import {
   addSmsLog,
   getSmsLogs,
   verifyReportAccessCode,
+  getAllNotices,
+  insertNotice,
+  deleteNoticeById,
   seedIfEmpty,
 } from './db.js';
 import { initiateShurjoPayCheckout, verifyShurjoPayOrder } from './shurjopay.js';
@@ -124,10 +127,139 @@ app.get('/api/health', (_req, res) => {
 app.get('/api/public/bootstrap', (_req, res) => {
   const settings = getSettings();
   const plans = getPlans();
+  const notices = getAllNotices();
   res.json({
     settings,
     plans,
+    notices,
     shurjopayMode: (process.env.SHURJOPAY_MODE || 'sandbox').toLowerCase(),
+  });
+});
+
+app.get('/api/public/notices', (_req, res) => {
+  res.json({ notices: getAllNotices() });
+});
+
+// Public: Membership Fee Progress Report — Step 1: Send OTP (Requires Club ID AND Phone)
+app.post('/api/public/progress-report/send-otp', async (req, res) => {
+  const clubId = String(req.body?.clubId || '').trim();
+  const phone = String(req.body?.phone || '').trim();
+  if (!clubId || !phone) {
+    return res.status(400).json({ error: 'Both Membership ID and Phone Number are required.' });
+  }
+  const normPhone = normalizePhone(phone);
+  const member = getAllMembers().find(
+    (m) =>
+      m.status === 'approved' &&
+      m.memberId &&
+      m.memberId.toLowerCase() === clubId.toLowerCase() &&
+      normalizePhone(m.phone) === normPhone
+  );
+  if (!member) {
+    return res.status(404).json({ error: 'No approved member found matching both Membership ID and Phone Number.' });
+  }
+
+  const code = String(crypto.randomInt(100000, 1000000));
+  const expiresAt = Date.now() + 5 * 60 * 1000;
+  db.prepare(
+    `INSERT OR REPLACE INTO otp_verifications (phone_normalized, code, expires_at, verified, attempts)
+     VALUES (?, ?, ?, 0, 0)`
+  ).run(normPhone, code, expiresAt);
+
+  const smsResult = await dispatchSms({
+    to: member.phone,
+    recipientName: member.fullName,
+    triggerType: 'AUTO_PROGRESS_REPORT_OTP',
+    message: `Your Armanitolians Club Fee Progress Report OTP is ${code}. Valid for 5 minutes.`,
+  });
+
+  const maskedPhone =
+    member.phone.length >= 6 ? `${member.phone.slice(0, 4)}****${member.phone.slice(-3)}` : member.phone;
+  res.json({ ok: true, maskedPhone, smsDelivered: smsResult.ok });
+});
+
+// Public: Membership Fee Progress Report — Step 2: Verify OTP & Return Full Report Payload
+app.post('/api/public/progress-report/verify-otp', (req, res) => {
+  const clubId = String(req.body?.clubId || '').trim();
+  const phone = String(req.body?.phone || '').trim();
+  const code = String(req.body?.code || '').trim();
+
+  const normPhone = normalizePhone(phone);
+  const member = getAllMembers().find(
+    (m) =>
+      m.status === 'approved' &&
+      m.memberId &&
+      m.memberId.toLowerCase() === clubId.toLowerCase() &&
+      normalizePhone(m.phone) === normPhone
+  );
+  if (!member) {
+    return res.status(404).json({ error: 'Approved member verification failed.' });
+  }
+
+  const row = db
+    .prepare('SELECT * FROM otp_verifications WHERE phone_normalized = ?')
+    .get(normPhone);
+  if (!row || Date.now() > Number(row.expires_at)) {
+    return res.status(400).json({ error: 'OTP expired or missing. Please request a new code.' });
+  }
+  if (Number(row.attempts) >= 5) {
+    return res.status(429).json({ error: 'Too many incorrect attempts. Please request a new code.' });
+  }
+  if (row.code !== code) {
+    db.prepare('UPDATE otp_verifications SET attempts = attempts + 1 WHERE phone_normalized = ?').run(
+      normPhone
+    );
+    return res.status(400).json({ error: 'Invalid OTP code. Please try again.' });
+  }
+
+  db.prepare('UPDATE otp_verifications SET verified = 1 WHERE phone_normalized = ?').run(normPhone);
+
+  const settings = getSettings();
+  const plans = getPlans();
+  const plan = plans.find((p) => p.id === member.planId);
+  const schedule = generateMemberSchedule(member, plan, settings);
+  const verifiedPayments = getAllPayments()
+    .filter((p) => p.memberId === member.memberId && p.status === 'verified')
+    .sort((a, b) => String(a.month).localeCompare(String(b.month)));
+
+  const verifiedMonths = new Set(verifiedPayments.map((p) => p.month));
+  const totalPaid = verifiedPayments.reduce((s, p) => s + Number(p.amount || 0), 0);
+  const totalPayable = Number(schedule.totalPayable || 0);
+  const totalDue = Math.max(0, totalPayable - totalPaid);
+  const paidInstallmentsCount = schedule.items.filter((i) => verifiedMonths.has(i.month)).length;
+  const dueInstallmentsCount = Math.max(0, schedule.items.length - paidInstallmentsCount);
+
+  res.json({
+    verified: true,
+    report: {
+      generatedDate: new Date().toLocaleDateString('en-GB', {
+        day: '2-digit',
+        month: 'long',
+        year: 'numeric',
+      }),
+      memberId: member.memberId,
+      name: member.fullName,
+      batch: member.batch,
+      subscriptionCategory: schedule.batchRule?.categoryEn || '-',
+      membershipType: plan?.nameEn || '-',
+      totalPayable,
+      totalPaid,
+      totalDue,
+      paidInstallmentsCount,
+      dueInstallmentsCount,
+      totalInstallments: schedule.items.length,
+      paidPayments: verifiedPayments.map((p, idx) => ({
+        no: idx + 1,
+        receiptNo: p.id,
+        date: p.date,
+        month: formatMonthLabel(p.month, 'en'),
+        paymentType: p.installmentLabel || 'Installment',
+        method: p.method,
+        transactionId: p.transactionId || '-',
+        amount: Number(p.amount || 0),
+      })),
+      settings,
+    },
   });
 });
 
@@ -738,9 +870,139 @@ app.get('/api/admin/bootstrap', requireAdmin, (_req, res) => {
     settings: getSettings(),
     auditLogs: getAuditLogs(),
     smsLogs: getSmsLogs(),
+    notices: getAllNotices(),
     shurjopayMode: (process.env.SHURJOPAY_MODE || 'sandbox').toLowerCase(),
     smsSenderId: process.env.GREENWEB_SENDER_ID || '8809617621831',
   });
+});
+
+// ==========================================
+// ADMIN NOTICES & PRESS RELEASES
+// ==========================================
+
+app.post('/api/admin/notices', requireAdmin, (req, res) => {
+  const { date, title, description, attachmentName, attachmentType, attachmentData } = req.body || {};
+  if (!title || !description) {
+    return res.status(400).json({ error: 'Notice title and description are required.' });
+  }
+  const notice = {
+    id: `NTC-${Date.now().toString().slice(-6)}`,
+    date: date || new Date().toISOString().slice(0, 10),
+    title: String(title).trim(),
+    description: String(description).trim(),
+    attachmentName: attachmentName || null,
+    attachmentType: attachmentType || null,
+    attachmentData: attachmentData || null,
+  };
+  insertNotice(notice);
+  addAuditLog('NOTICE_PUBLISHED', `Published notice: "${notice.title}"`, req.admin.username);
+  res.status(201).json({ notice, notices: getAllNotices() });
+});
+
+app.delete('/api/admin/notices/:id', requireAdmin, (req, res) => {
+  deleteNoticeById(req.params.id);
+  addAuditLog('NOTICE_DELETED', `Deleted notice ${req.params.id}`, req.admin.username);
+  res.json({ ok: true, notices: getAllNotices() });
+});
+
+// ==========================================
+// DUE REMINDER ENGINE (7th of Every Month at 4:00 PM BST + Manual Admin Trigger)
+// ==========================================
+
+function buildDueReminderBanglaMessage(amount) {
+  return `প্রিয় সদস্য, আমাদের রেকর্ড অনুযায়ী আপনার মাসিক চাঁদা এখনো বকেয়া রয়েছে। অনুগ্রহ করে বকেয়া পেমেন্টঃ ${Number(amount).toLocaleString()} টাকা পরিশোধ করুন। উল্লেখ্য, প্রতি মাসের ১০ তারিখের মধ্যে মাসিক পেমেন্ট/ইনস্টলমেন্ট পরিশোধ করার অনুরোধ রইল।\nধন্যবাদান্তে,\nআরমানিটোলিয়ান্স ক্লাব`;
+}
+
+function computeOverdueMembers(targetMonth) {
+  const settings = getSettings();
+  const plans = getPlans();
+  const allMembers = getAllMembers().filter((m) => m.status === 'approved');
+  const allPayments = getAllPayments().filter((p) => p.status === 'verified');
+  const overdue = [];
+
+  for (const m of allMembers) {
+    const plan = plans.find((p) => p.id === m.planId);
+    if (!plan || Number(plan.fee) === 0) continue;
+    const sched = generateMemberSchedule(m, plan, settings);
+    const paidMonths = new Set(allPayments.filter((p) => p.memberId === m.memberId).map((p) => p.month));
+    const missed = sched.items.filter((item) => item.month <= targetMonth && !paidMonths.has(item.month));
+    if (missed.length > 0) {
+      const dueAmount = missed.reduce((sum, i) => sum + Number(i.amount || 0), 0);
+      overdue.push({
+        memberId: m.memberId,
+        name: m.fullName,
+        batch: m.batch,
+        phone: m.phone,
+        missedCount: missed.length,
+        dueAmount,
+        message: buildDueReminderBanglaMessage(dueAmount),
+      });
+    }
+  }
+  return overdue;
+}
+
+app.get('/api/admin/dues/preview', requireAdmin, (req, res) => {
+  const month = String(req.query.month || new Date().toISOString().slice(0, 7));
+  const overdue = computeOverdueMembers(month);
+  res.json({ month, overdue, totalOverdueAmount: overdue.reduce((s, x) => s + x.dueAmount, 0) });
+});
+
+app.post('/api/admin/dues/send-reminders', requireAdmin, async (req, res) => {
+  const month = String(req.body?.month || new Date().toISOString().slice(0, 7));
+  const overdue = computeOverdueMembers(month);
+  if (overdue.length === 0) {
+    return res.json({ ok: true, sentCount: 0, totalCount: 0, smsLogs: getSmsLogs() });
+  }
+
+  let sentCount = 0;
+  for (const item of overdue) {
+    if (!item.phone) continue;
+    const result = await dispatchSms({
+      to: item.phone,
+      recipientName: item.name,
+      triggerType: 'DUE_REMINDER_SMS',
+      message: item.message,
+    });
+    if (result.ok) sentCount++;
+  }
+
+  addAuditLog(
+    'DUE_REMINDERS_SENT',
+    `Sent Due Reminder SMS for ${month} to ${overdue.length} overdue members (${sentCount} delivered)`,
+    req.admin.username
+  );
+
+  res.json({ ok: true, sentCount, totalCount: overdue.length, smsLogs: getSmsLogs() });
+});
+
+// Vercel Scheduled Cron Endpoint: Runs every month on the 7th at 4:00 PM BST (10:00 UTC)
+app.get('/api/cron/due-reminders', async (req, res) => {
+  const cronSecret = process.env.CRON_SECRET;
+  const authHeader = req.headers.authorization || '';
+  if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
+    return res.status(401).json({ error: 'Unauthorized cron invocation' });
+  }
+
+  const currentMonth = new Date().toISOString().slice(0, 7);
+  const overdue = computeOverdueMembers(currentMonth);
+  let sentCount = 0;
+  for (const item of overdue) {
+    if (!item.phone) continue;
+    const result = await dispatchSms({
+      to: item.phone,
+      recipientName: item.name,
+      triggerType: 'CRON_DUE_REMINDER',
+      message: item.message,
+    });
+    if (result.ok) sentCount++;
+  }
+  addAuditLog(
+    'CRON_DUE_REMINDER',
+    `Automated 7th-day 4PM Due Reminder dispatched for ${currentMonth}: ${sentCount}/${overdue.length} delivered`,
+    'System Cron'
+  );
+  res.json({ ok: true, month: currentMonth, sentCount, totalCount: overdue.length });
 });
 
 // Admin: Send Manual, Personalized Template, or Bulk SMS via GreenWeb
