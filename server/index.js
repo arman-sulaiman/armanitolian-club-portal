@@ -5,11 +5,13 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  db,
-  initDatabase,
+  isPostgres,
+  ensureDbReady,
   verifyPassword,
   hashPassword,
   normalizePhone,
+  getAdminByUsername,
+  updateAdminPassword,
   getPlans,
   savePlans,
   getSettings,
@@ -18,6 +20,14 @@ import {
   upsertMember,
   getAllPayments,
   upsertPayment,
+  createPaymentOrder,
+  updatePaymentOrderSpId,
+  getPaymentOrder,
+  updatePaymentOrderStatus,
+  saveOtp,
+  getOtp,
+  incrementOtpAttempts,
+  markOtpVerified,
   addAuditLog,
   getAuditLogs,
   addSmsLog,
@@ -30,26 +40,30 @@ import {
 } from './db.js';
 import { initiateShurjoPayCheckout, verifyShurjoPayOrder } from './shurjopay.js';
 import { sendGreenWebSms } from './sms.js';
-import { generateMemberSchedule, getBatchRule, formatMonthLabel } from '../src/utils/subscriptionEngine.js';
-
-async function dispatchSms({ to, recipientName, message, triggerType }) {
-  const result = await sendGreenWebSms({ to, message });
-  addSmsLog({
-    recipientName: recipientName || '',
-    recipientPhone: result.recipients.join(', ') || String(to || ''),
-    triggerType,
-    message,
-    status: result.ok ? 'sent' : 'failed',
-    providerResponse: result.providerResponse,
-  });
-  return result;
-}
-
-initDatabase();
+import {
+  generateMemberSchedule,
+  getBatchRule,
+  formatMonthLabel,
+} from '../src/utils/subscriptionEngine.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
 const AUTH_SECRET = process.env.AUTH_SECRET || 'armanitollian-club-secret';
+
+app.use(cors());
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Ensure DB schema & seed are initialized before handling any API request
+app.use('/api', async (_req, res, next) => {
+  try {
+    await ensureDbReady();
+    next();
+  } catch (err) {
+    console.error('Database initialization error:', err);
+    res.status(500).json({ error: 'Database initialization failed: ' + err.message });
+  }
+});
 
 function getBaseUrls(req) {
   const proto = req?.headers?.['x-forwarded-proto'] || (process.env.VERCEL ? 'https' : 'http');
@@ -68,11 +82,20 @@ function getBaseUrls(req) {
   return { appUrl, apiUrl };
 }
 
-app.use(cors());
-app.use(express.json({ limit: '15mb' }));
-app.use(express.urlencoded({ extended: true }));
+async function dispatchSms({ to, recipientName, message, triggerType }) {
+  const result = await sendGreenWebSms({ to, message });
+  await addSmsLog({
+    recipientName: recipientName || '',
+    recipientPhone: result.recipients.join(', ') || String(to || ''),
+    triggerType,
+    message,
+    status: result.ok ? 'sent' : 'failed',
+    providerResponse: result.providerResponse,
+  });
+  return result;
+}
 
-// --- Simple HMAC-SHA256 Signed Auth Token ---
+// --- HMAC-SHA256 Signed Auth Token ---
 function createToken(payload) {
   const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
   const body = Buffer.from(
@@ -120,14 +143,17 @@ function requireAdmin(req, res, next) {
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
+    database: isPostgres ? 'postgresql' : 'sqlite',
     shurjopayMode: (process.env.SHURJOPAY_MODE || 'sandbox').toLowerCase(),
   });
 });
 
-app.get('/api/public/bootstrap', (_req, res) => {
-  const settings = getSettings();
-  const plans = getPlans();
-  const notices = getAllNotices();
+app.get('/api/public/bootstrap', async (_req, res) => {
+  const [settings, plans, notices] = await Promise.all([
+    getSettings(),
+    getPlans(),
+    getAllNotices(),
+  ]);
   res.json({
     settings,
     plans,
@@ -136,11 +162,11 @@ app.get('/api/public/bootstrap', (_req, res) => {
   });
 });
 
-app.get('/api/public/notices', (_req, res) => {
-  res.json({ notices: getAllNotices() });
+app.get('/api/public/notices', async (_req, res) => {
+  res.json({ notices: await getAllNotices() });
 });
 
-// Public: Membership Fee Progress Report — Step 1: Send OTP (Requires Club ID AND Phone)
+// Public: Membership Fee Progress Report — Send OTP
 app.post('/api/public/progress-report/send-otp', async (req, res) => {
   const clubId = String(req.body?.clubId || '').trim();
   const phone = String(req.body?.phone || '').trim();
@@ -148,7 +174,8 @@ app.post('/api/public/progress-report/send-otp', async (req, res) => {
     return res.status(400).json({ error: 'Both Membership ID and Phone Number are required.' });
   }
   const normPhone = normalizePhone(phone);
-  const member = getAllMembers().find(
+  const members = await getAllMembers();
+  const member = members.find(
     (m) =>
       m.status === 'approved' &&
       m.memberId &&
@@ -156,15 +183,13 @@ app.post('/api/public/progress-report/send-otp', async (req, res) => {
       normalizePhone(m.phone) === normPhone
   );
   if (!member) {
-    return res.status(404).json({ error: 'No approved member found matching both Membership ID and Phone Number.' });
+    return res.status(404).json({
+      error: 'No approved member found matching both Membership ID and Phone Number.',
+    });
   }
 
   const code = String(crypto.randomInt(100000, 1000000));
-  const expiresAt = Date.now() + 5 * 60 * 1000;
-  db.prepare(
-    `INSERT OR REPLACE INTO otp_verifications (phone_normalized, code, expires_at, verified, attempts)
-     VALUES (?, ?, ?, 0, 0)`
-  ).run(normPhone, code, expiresAt);
+  await saveOtp(normPhone, code, Date.now() + 5 * 60 * 1000);
 
   const smsResult = await dispatchSms({
     to: member.phone,
@@ -178,14 +203,15 @@ app.post('/api/public/progress-report/send-otp', async (req, res) => {
   res.json({ ok: true, maskedPhone, smsDelivered: smsResult.ok });
 });
 
-// Public: Membership Fee Progress Report — Step 2: Verify OTP & Return Full Report Payload
-app.post('/api/public/progress-report/verify-otp', (req, res) => {
+// Public: Membership Fee Progress Report — Verify OTP & Return Report
+app.post('/api/public/progress-report/verify-otp', async (req, res) => {
   const clubId = String(req.body?.clubId || '').trim();
   const phone = String(req.body?.phone || '').trim();
   const code = String(req.body?.code || '').trim();
 
   const normPhone = normalizePhone(phone);
-  const member = getAllMembers().find(
+  const members = await getAllMembers();
+  const member = members.find(
     (m) =>
       m.status === 'approved' &&
       m.memberId &&
@@ -196,9 +222,7 @@ app.post('/api/public/progress-report/verify-otp', (req, res) => {
     return res.status(404).json({ error: 'Approved member verification failed.' });
   }
 
-  const row = db
-    .prepare('SELECT * FROM otp_verifications WHERE phone_normalized = ?')
-    .get(normPhone);
+  const row = await getOtp(normPhone);
   if (!row || Date.now() > Number(row.expires_at)) {
     return res.status(400).json({ error: 'OTP expired or missing. Please request a new code.' });
   }
@@ -206,19 +230,20 @@ app.post('/api/public/progress-report/verify-otp', (req, res) => {
     return res.status(429).json({ error: 'Too many incorrect attempts. Please request a new code.' });
   }
   if (row.code !== code) {
-    db.prepare('UPDATE otp_verifications SET attempts = attempts + 1 WHERE phone_normalized = ?').run(
-      normPhone
-    );
+    await incrementOtpAttempts(normPhone);
     return res.status(400).json({ error: 'Invalid OTP code. Please try again.' });
   }
 
-  db.prepare('UPDATE otp_verifications SET verified = 1 WHERE phone_normalized = ?').run(normPhone);
+  await markOtpVerified(normPhone);
 
-  const settings = getSettings();
-  const plans = getPlans();
+  const [settings, plans, allPayments] = await Promise.all([
+    getSettings(),
+    getPlans(),
+    getAllPayments(),
+  ]);
   const plan = plans.find((p) => p.id === member.planId);
   const schedule = generateMemberSchedule(member, plan, settings);
-  const verifiedPayments = getAllPayments()
+  const verifiedPayments = allPayments
     .filter((p) => p.memberId === member.memberId && p.status === 'verified')
     .sort((a, b) => String(a.month).localeCompare(String(b.month)));
 
@@ -263,7 +288,7 @@ app.post('/api/public/progress-report/verify-otp', (req, res) => {
   });
 });
 
-// Public: Send 6-Digit SMS OTP for Step 5 Registration Verification
+// Public: Registration OTP Send
 app.post('/api/public/otp/send', async (req, res) => {
   const rawPhone = String(req.body?.phone || '').trim();
   const fullName = String(req.body?.fullName || 'Applicant').trim();
@@ -274,18 +299,13 @@ app.post('/api/public/otp/send', async (req, res) => {
   }
 
   const code = String(crypto.randomInt(100000, 1000000));
-  const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
-
-  db.prepare(
-    `INSERT OR REPLACE INTO otp_verifications (phone_normalized, code, expires_at, verified, attempts)
-     VALUES (?, ?, ?, 0, 0)`
-  ).run(normPhone, code, expiresAt);
+  await saveOtp(normPhone, code, Date.now() + 5 * 60 * 1000);
 
   const smsResult = await dispatchSms({
     to: rawPhone,
     recipientName: fullName,
     triggerType: 'AUTO_OTP',
-    message: `Your Armanitollian Club verification code is ${code}. Valid for 5 minutes. Do not share this code with anyone.`,
+    message: `Your Armanitolians Club verification code is ${code}. Valid for 5 minutes. Do not share this code with anyone.`,
   });
 
   const maskedPhone = rawPhone.length >= 6 ? `${rawPhone.slice(0, 4)}****${rawPhone.slice(-3)}` : rawPhone;
@@ -298,8 +318,8 @@ app.post('/api/public/otp/send', async (req, res) => {
   });
 });
 
-// Public: Verify 6-Digit SMS OTP
-app.post('/api/public/otp/verify', (req, res) => {
+// Public: Registration OTP Verify
+app.post('/api/public/otp/verify', async (req, res) => {
   const rawPhone = String(req.body?.phone || '').trim();
   const code = String(req.body?.code || '').trim();
   const normPhone = normalizePhone(rawPhone);
@@ -308,42 +328,33 @@ app.post('/api/public/otp/verify', (req, res) => {
     return res.status(400).json({ error: 'Please enter the 6-digit verification code.' });
   }
 
-  const row = db
-    .prepare('SELECT * FROM otp_verifications WHERE phone_normalized = ?')
-    .get(normPhone);
-
+  const row = await getOtp(normPhone);
   if (!row) {
     return res.status(400).json({ error: 'No verification code found. Please request a new code.' });
   }
-
   if (Date.now() > Number(row.expires_at)) {
     return res.status(400).json({ error: 'Verification code has expired. Please request a new code.' });
   }
-
   if (Number(row.attempts) >= 5) {
     return res.status(429).json({ error: 'Too many incorrect attempts. Please request a new code.' });
   }
-
   if (row.code !== code) {
-    db.prepare('UPDATE otp_verifications SET attempts = attempts + 1 WHERE phone_normalized = ?').run(
-      normPhone
-    );
+    await incrementOtpAttempts(normPhone);
     return res.status(400).json({ error: 'Invalid verification code. Please check and try again.' });
   }
 
-  db.prepare('UPDATE otp_verifications SET verified = 1 WHERE phone_normalized = ?').run(normPhone);
+  await markOtpVerified(normPhone);
   const otpToken = createToken({ phone: normPhone, purpose: 'register_otp' });
   res.json({ verified: true, otpToken });
 });
 
 // Public Member Registration
-app.post('/api/public/register', (req, res) => {
+app.post('/api/public/register', async (req, res) => {
   const body = req.body || {};
   if (!body.fullName || !body.batch || !body.phone) {
     return res.status(400).json({ error: 'Full name, batch, and phone number are required.' });
   }
 
-  // Enforce SMS OTP verification for public applicants (Admin-authenticated requests may bypass)
   const auth = req.headers.authorization || '';
   const isAdminReq = auth.startsWith('Bearer ') && Boolean(verifyToken(auth.slice(7)));
   if (!isAdminReq) {
@@ -357,13 +368,13 @@ app.post('/api/public/register', (req, res) => {
     }
   }
 
-  const plans = getPlans();
+  const plans = await getPlans();
   const chosenPlan = plans.find((p) => p.id === body.planId);
   if (!chosenPlan || chosenPlan.enabled === false) {
     return res.status(400).json({ error: 'Selected subscription plan is currently unavailable.' });
   }
 
-  const existing = getAllMembers();
+  const existing = await getAllMembers();
   const seq = String(1001 + existing.length).padStart(4, '0');
   const appId = `APP-2026-${seq}`;
 
@@ -379,32 +390,31 @@ app.post('/api/public/register', (req, res) => {
     paymentMode: chosenPlan.allowInstallment ? body.paymentMode || 'installment' : 'full',
   };
 
-  upsertMember(newMember);
-  addAuditLog(
+  await upsertMember(newMember);
+  await addAuditLog(
     'APPLICATION_SUBMITTED',
     `New public registration ${appId} by ${newMember.fullName} (SSC ${newMember.batch})`,
     'Public Applicant'
   );
 
-  // Auto SMS on Registration
   dispatchSms({
     to: newMember.phone,
     recipientName: newMember.fullName,
     triggerType: 'AUTO_REGISTER',
-    message: `Dear ${newMember.fullName}, your Armanitollian Club membership application has been received. Tracking ID: ${appId}. You will be notified once reviewed.`,
+    message: `Dear ${newMember.fullName}, your Armanitolians Club membership application has been received. Tracking ID: ${appId}. You will be notified once reviewed.`,
   }).catch(() => {});
 
   res.status(201).json({ member: newMember });
 });
 
-// Public Application / Registration Tracker (by Tracking ID OR Phone)
-app.post('/api/public/track', (req, res) => {
+// Public Application Tracker
+app.post('/api/public/track', async (req, res) => {
   const query = String(req.body?.query || '').trim();
   if (!query) {
     return res.status(400).json({ error: 'Please enter your Application ID or Phone Number.' });
   }
 
-  const members = getAllMembers();
+  const [members, plans] = await Promise.all([getAllMembers(), getPlans()]);
   const normQ = normalizePhone(query);
 
   const match = members.find(
@@ -418,16 +428,14 @@ app.post('/api/public/track', (req, res) => {
     return res.status(404).json({ error: 'No registration found with that Tracking ID or Phone Number.' });
   }
 
-  const plan = getPlans().find((p) => p.id === match.planId);
+  const plan = plans.find((p) => p.id === match.planId);
   res.json({
     application: {
       id: match.id,
       memberId: match.memberId,
       fullName: match.fullName,
       batch: match.batch,
-      phoneMasked: match.phone
-        ? `${match.phone.slice(0, 4)}****${match.phone.slice(-3)}`
-        : '',
+      phoneMasked: match.phone ? `${match.phone.slice(0, 4)}****${match.phone.slice(-3)}` : '',
       status: match.status,
       submittedAt: match.submittedAt,
       approvedAt: match.approvedAt,
@@ -439,10 +447,11 @@ app.post('/api/public/track', (req, res) => {
   });
 });
 
-// Public: Send OTP for Revision Edit (looks up registered phone by trackingId)
+// Public Revision OTP Send
 app.post('/api/public/revision/send-otp', async (req, res) => {
   const trackingId = String(req.body?.trackingId || '').trim();
-  const member = getAllMembers().find(
+  const members = await getAllMembers();
+  const member = members.find(
     (m) => m.id.toLowerCase() === trackingId.toLowerCase() && m.status === 'revision'
   );
   if (!member) {
@@ -450,12 +459,7 @@ app.post('/api/public/revision/send-otp', async (req, res) => {
   }
   const normPhone = normalizePhone(member.phone);
   const code = String(crypto.randomInt(100000, 1000000));
-  const expiresAt = Date.now() + 5 * 60 * 1000;
-
-  db.prepare(
-    `INSERT OR REPLACE INTO otp_verifications (phone_normalized, code, expires_at, verified, attempts)
-     VALUES (?, ?, ?, 0, 0)`
-  ).run(normPhone, code, expiresAt);
+  await saveOtp(normPhone, code, Date.now() + 5 * 60 * 1000);
 
   const smsResult = await dispatchSms({
     to: member.phone,
@@ -465,27 +469,23 @@ app.post('/api/public/revision/send-otp', async (req, res) => {
   });
 
   const maskedPhone =
-    member.phone.length >= 6
-      ? `${member.phone.slice(0, 4)}****${member.phone.slice(-3)}`
-      : member.phone;
-
+    member.phone.length >= 6 ? `${member.phone.slice(0, 4)}****${member.phone.slice(-3)}` : member.phone;
   res.json({ ok: true, maskedPhone, smsDelivered: smsResult.ok });
 });
 
-// Public: Verify Revision OTP & Return Editable Application Data
-app.post('/api/public/revision/verify-otp', (req, res) => {
+// Public Revision OTP Verify
+app.post('/api/public/revision/verify-otp', async (req, res) => {
   const trackingId = String(req.body?.trackingId || '').trim();
   const code = String(req.body?.code || '').trim();
-  const member = getAllMembers().find(
+  const members = await getAllMembers();
+  const member = members.find(
     (m) => m.id.toLowerCase() === trackingId.toLowerCase() && m.status === 'revision'
   );
   if (!member) {
     return res.status(404).json({ error: 'Application not found or not eligible for revision.' });
   }
   const normPhone = normalizePhone(member.phone);
-  const row = db
-    .prepare('SELECT * FROM otp_verifications WHERE phone_normalized = ?')
-    .get(normPhone);
+  const row = await getOtp(normPhone);
 
   if (!row || Date.now() > Number(row.expires_at)) {
     return res.status(400).json({ error: 'Verification code expired or missing. Please request a new code.' });
@@ -494,26 +494,25 @@ app.post('/api/public/revision/verify-otp', (req, res) => {
     return res.status(429).json({ error: 'Too many attempts. Please request a new code.' });
   }
   if (row.code !== code) {
-    db.prepare('UPDATE otp_verifications SET attempts = attempts + 1 WHERE phone_normalized = ?').run(
-      normPhone
-    );
+    await incrementOtpAttempts(normPhone);
     return res.status(400).json({ error: 'Invalid verification code.' });
   }
 
-  db.prepare('UPDATE otp_verifications SET verified = 1 WHERE phone_normalized = ?').run(normPhone);
+  await markOtpVerified(normPhone);
   const revisionToken = createToken({ id: member.id, phone: normPhone, purpose: 'revision_edit' });
   res.json({ verified: true, revisionToken, member });
 });
 
-// Public: Resubmit Revised Application (OTP Token Verified)
-app.put('/api/public/revision/resubmit', (req, res) => {
+// Public Revision Resubmit
+app.put('/api/public/revision/resubmit', async (req, res) => {
   const { revisionToken, updates } = req.body || {};
   const decoded = verifyToken(revisionToken || '');
   if (!decoded || decoded.purpose !== 'revision_edit') {
     return res.status(403).json({ error: 'OTP verification is required to resubmit this application.' });
   }
 
-  const existing = getAllMembers().find((m) => m.id === decoded.id);
+  const members = await getAllMembers();
+  const existing = members.find((m) => m.id === decoded.id);
   if (!existing || existing.status !== 'revision') {
     return res.status(404).json({ error: 'Revision application not found.' });
   }
@@ -528,8 +527,8 @@ app.put('/api/public/revision/resubmit', (req, res) => {
     remarks: `Resubmitted after revision (Previous note: ${existing.remarks || 'N/A'})`,
   };
 
-  upsertMember(updated);
-  addAuditLog(
+  await upsertMember(updated);
+  await addAuditLog(
     'APPLICATION_RESUBMITTED',
     `Applicant ${updated.fullName} (${updated.id}) resubmitted revised application`,
     'Public Applicant'
@@ -547,17 +546,22 @@ app.put('/api/public/revision/resubmit', (req, res) => {
   res.json({ member: updated });
 });
 
-// Public Approved Member Payment Lookup (Requires BOTH Club ID AND Phone Number)
-app.post('/api/public/member-payments', (req, res) => {
+// Public Approved Member Payments Lookup
+app.post('/api/public/member-payments', async (req, res) => {
   const clubId = String(req.body?.clubId || '').trim();
   const phone = String(req.body?.phone || '').trim();
-
   if (!clubId || !phone) {
     return res.status(400).json({ error: 'Both Club Member ID and Phone Number are required.' });
   }
 
   const normPhone = normalizePhone(phone);
-  const members = getAllMembers();
+  const [members, plans, allPayments, settings] = await Promise.all([
+    getAllMembers(),
+    getPlans(),
+    getAllPayments(),
+    getSettings(),
+  ]);
+
   const member = members.find(
     (m) =>
       m.status === 'approved' &&
@@ -572,8 +576,8 @@ app.post('/api/public/member-payments', (req, res) => {
     });
   }
 
-  const plan = getPlans().find((p) => p.id === member.planId);
-  const memberPayments = getAllPayments().filter((p) => p.memberId === member.memberId);
+  const plan = plans.find((p) => p.id === member.planId);
+  const memberPayments = allPayments.filter((p) => p.memberId === member.memberId);
 
   res.json({
     member: {
@@ -591,7 +595,7 @@ app.post('/api/public/member-payments', (req, res) => {
     },
     plan,
     payments: memberPayments,
-    settings: getSettings(),
+    settings,
   });
 });
 
@@ -606,7 +610,8 @@ app.post('/api/shurjopay/initiate', async (req, res) => {
   }
 
   const normPhone = normalizePhone(phone);
-  const member = getAllMembers().find(
+  const members = await getAllMembers();
+  const member = members.find(
     (m) =>
       m.status === 'approved' &&
       m.memberId &&
@@ -623,19 +628,16 @@ app.post('/api/shurjopay/initiate', async (req, res) => {
   const returnUrl = `${apiUrl}/api/shurjopay/callback`;
   const cancelUrl = `${apiUrl}/api/shurjopay/cancel`;
 
-  db.prepare(
-    `INSERT INTO payment_orders (order_id, member_id, member_name, batch, month, payment_type, installment_label, amount, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'initiated')`
-  ).run(
+  await createPaymentOrder({
     orderId,
-    member.memberId,
-    member.fullName,
-    member.batch,
+    memberId: member.memberId,
+    memberName: member.fullName,
+    batch: member.batch,
     month,
-    paymentType || 'installment',
-    installmentLabel || 'Monthly Installment',
-    Number(amount)
-  );
+    paymentType: paymentType || 'installment',
+    installmentLabel: installmentLabel || 'Monthly Installment',
+    amount: Number(amount),
+  });
 
   try {
     const sp = await initiateShurjoPayCheckout({
@@ -650,10 +652,7 @@ app.post('/api/shurjopay/initiate', async (req, res) => {
       clientIp: req.ip || '127.0.0.1',
     });
 
-    db.prepare('UPDATE payment_orders SET sp_order_id = ? WHERE order_id = ?').run(
-      sp.spOrderId,
-      orderId
-    );
+    await updatePaymentOrderSpId(orderId, sp.spOrderId);
 
     return res.json({
       checkoutUrl: sp.checkoutUrl,
@@ -663,7 +662,6 @@ app.post('/api/shurjopay/initiate', async (req, res) => {
       simulated: false,
     });
   } catch (err) {
-    // Graceful sandbox fallback if ShurjoPay sandbox server is unreachable in offline/dev environments
     return res.json({
       checkoutUrl: null,
       orderId,
@@ -674,13 +672,11 @@ app.post('/api/shurjopay/initiate', async (req, res) => {
   }
 });
 
-// ShurjoPay Cancel Redirect (clean URL without # fragment)
 app.all('/api/shurjopay/cancel', (req, res) => {
   const { appUrl } = getBaseUrls(req);
   return res.redirect(`${appUrl}/#portal?payment=cancelled`);
 });
 
-// ShurjoPay Return Callback (accepts both GET & POST from ShurjoPay)
 app.all('/api/shurjopay/callback', async (req, res) => {
   const { appUrl } = getBaseUrls(req);
   const spOrderId = String(
@@ -690,10 +686,7 @@ app.all('/api/shurjopay/callback', async (req, res) => {
     return res.redirect(`${appUrl}/#portal?payment=failed`);
   }
 
-  const order = db
-    .prepare('SELECT * FROM payment_orders WHERE sp_order_id = ? OR order_id = ?')
-    .get(spOrderId, spOrderId);
-
+  const order = await getPaymentOrder(spOrderId);
   if (!order) {
     return res.redirect(`${appUrl}/#portal?payment=failed`);
   }
@@ -704,7 +697,8 @@ app.all('/api/shurjopay/callback', async (req, res) => {
     );
   }
 
-  const memberObj = getAllMembers().find((m) => m.memberId === order.member_id);
+  const members = await getAllMembers();
+  const memberObj = members.find((m) => m.memberId === order.member_id);
 
   try {
     const verification = await verifyShurjoPayOrder(spOrderId);
@@ -726,23 +720,20 @@ app.all('/api/shurjopay/callback', async (req, res) => {
         status: 'verified',
         notes: `Paid online via ShurjoPay (${verification.mode}) · Order ${order.order_id}`,
       };
-      upsertPayment(paymentRecord);
-      db.prepare("UPDATE payment_orders SET status = 'completed' WHERE order_id = ?").run(
-        order.order_id
-      );
-      addAuditLog(
+      await upsertPayment(paymentRecord);
+      await updatePaymentOrderStatus(order.order_id, 'completed');
+      await addAuditLog(
         'SHURJOPAY_VERIFIED',
         `Online ShurjoPay payment ${receiptId} (৳${order.amount}) verified for ${order.member_name} (${order.installment_label})`,
         'ShurjoPay Gateway'
       );
 
-      // Auto SMS on Payment Success
       if (memberObj?.phone) {
         dispatchSms({
           to: memberObj.phone,
           recipientName: order.member_name,
           triggerType: 'AUTO_PAYMENT_SUCCESS',
-          message: `Dear ${order.member_name}, your Armanitollian Club payment of BDT ${Number(order.amount).toLocaleString()} for ${order.installment_label} (${order.month}) is SUCCESSFUL. Receipt: ${receiptId}. TrxID: ${trxId}. Thank you.`,
+          message: `Dear ${order.member_name}, your Armanitolians Club payment of BDT ${Number(order.amount).toLocaleString()} for ${order.installment_label} (${order.month}) is SUCCESSFUL. Receipt: ${receiptId}. TrxID: ${trxId}. Thank you.`,
         }).catch(() => {});
       }
 
@@ -750,20 +741,18 @@ app.all('/api/shurjopay/callback', async (req, res) => {
         `${appUrl}/#portal?payment=success&receipt=${encodeURIComponent(receiptId)}&clubId=${encodeURIComponent(order.member_id)}&amount=${encodeURIComponent(order.amount)}&label=${encodeURIComponent(order.installment_label)}&month=${encodeURIComponent(order.month)}&trxId=${encodeURIComponent(trxId)}`
       );
     }
-    console.warn('ShurjoPay verification returned non-success:', verification.record);
   } catch (err) {
     console.error('ShurjoPay callback verification error:', err.message);
   }
 
-  db.prepare("UPDATE payment_orders SET status = 'failed' WHERE order_id = ?").run(order.order_id);
+  await updatePaymentOrderStatus(order.order_id, 'failed');
 
-  // Auto SMS on Payment Failed
   if (memberObj?.phone) {
     dispatchSms({
       to: memberObj.phone,
       recipientName: order.member_name,
       triggerType: 'AUTO_PAYMENT_FAILED',
-      message: `Dear ${order.member_name}, your Armanitollian Club payment of BDT ${Number(order.amount).toLocaleString()} for ${order.installment_label} (${order.month}) could not be completed (Order: ${order.order_id}). Please try again or contact the club office.`,
+      message: `Dear ${order.member_name}, your Armanitolians Club payment of BDT ${Number(order.amount).toLocaleString()} for ${order.installment_label} (${order.month}) could not be completed (Order: ${order.order_id}). Please try again or contact the club office.`,
     }).catch(() => {});
   }
 
@@ -772,13 +761,12 @@ app.all('/api/shurjopay/callback', async (req, res) => {
   );
 });
 
-// Local Sandbox Simulator Completion (only active when SHURJOPAY_MODE !== 'live')
-app.post('/api/shurjopay/simulate-complete', (req, res) => {
+app.post('/api/shurjopay/simulate-complete', async (req, res) => {
   if ((process.env.SHURJOPAY_MODE || 'sandbox').toLowerCase() === 'live') {
     return res.status(403).json({ error: 'Simulator disabled in live mode.' });
   }
   const { orderId, channel = 'bKash (Sandbox)' } = req.body || {};
-  const order = db.prepare('SELECT * FROM payment_orders WHERE order_id = ?').get(orderId);
+  const order = await getPaymentOrder(orderId);
   if (!order) return res.status(404).json({ error: 'Order not found.' });
 
   const receiptId = `RCP-SP-${Date.now().toString().slice(-6)}`;
@@ -797,21 +785,22 @@ app.post('/api/shurjopay/simulate-complete', (req, res) => {
     status: 'verified',
     notes: `Paid online via ShurjoPay Sandbox · Order ${order.order_id}`,
   };
-  upsertPayment(paymentRecord);
-  db.prepare("UPDATE payment_orders SET status = 'completed' WHERE order_id = ?").run(order.order_id);
-  addAuditLog(
+  await upsertPayment(paymentRecord);
+  await updatePaymentOrderStatus(order.order_id, 'completed');
+  await addAuditLog(
     'SHURJOPAY_VERIFIED',
     `ShurjoPay Sandbox payment ${receiptId} (৳${order.amount}) verified for ${order.member_name}`,
     'ShurjoPay Sandbox'
   );
 
-  const memberObj = getAllMembers().find((m) => m.memberId === order.member_id);
+  const members = await getAllMembers();
+  const memberObj = members.find((m) => m.memberId === order.member_id);
   if (memberObj?.phone) {
     dispatchSms({
       to: memberObj.phone,
       recipientName: order.member_name,
       triggerType: 'AUTO_PAYMENT_SUCCESS',
-      message: `Dear ${order.member_name}, your Armanitollian Club payment of BDT ${Number(order.amount).toLocaleString()} for ${order.installment_label} (${order.month}) is SUCCESSFUL. Receipt: ${receiptId}. Thank you.`,
+      message: `Dear ${order.member_name}, your Armanitolians Club payment of BDT ${Number(order.amount).toLocaleString()} for ${order.installment_label} (${order.month}) is SUCCESSFUL. Receipt: ${receiptId}. Thank you.`,
     }).catch(() => {});
   }
 
@@ -822,15 +811,15 @@ app.post('/api/shurjopay/simulate-complete', (req, res) => {
 // ADMIN AUTHENTICATION ENDPOINTS
 // ==========================================
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body || {};
-  const admin = db.prepare('SELECT * FROM admins WHERE username = ?').get(String(username || '').trim());
+  const admin = await getAdminByUsername(String(username || '').trim());
   if (!admin || !verifyPassword(String(password || ''), admin.password_hash)) {
     return res.status(401).json({ error: 'Invalid username or password.' });
   }
 
   const token = createToken({ id: admin.id, username: admin.username, role: admin.role });
-  addAuditLog('ADMIN_LOGIN', `Admin "${admin.username}" signed in to dashboard`, admin.username);
+  await addAuditLog('ADMIN_LOGIN', `Admin "${admin.username}" signed in to dashboard`, admin.username);
   res.json({
     token,
     admin: { username: admin.username, role: admin.role },
@@ -841,20 +830,17 @@ app.get('/api/auth/me', requireAdmin, (req, res) => {
   res.json({ admin: { username: req.admin.username, role: req.admin.role } });
 });
 
-app.post('/api/auth/change-password', requireAdmin, (req, res) => {
+app.post('/api/auth/change-password', requireAdmin, async (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
   if (!newPassword || String(newPassword).length < 6) {
     return res.status(400).json({ error: 'New password must be at least 6 characters.' });
   }
-  const admin = db.prepare('SELECT * FROM admins WHERE username = ?').get(req.admin.username);
+  const admin = await getAdminByUsername(req.admin.username);
   if (!admin || !verifyPassword(String(currentPassword || ''), admin.password_hash)) {
     return res.status(400).json({ error: 'Current password is incorrect.' });
   }
-  db.prepare('UPDATE admins SET password_hash = ? WHERE id = ?').run(
-    hashPassword(String(newPassword)),
-    admin.id
-  );
-  addAuditLog('ADMIN_PASSWORD_CHANGED', `Admin "${admin.username}" updated password`, admin.username);
+  await updateAdminPassword(admin.id, hashPassword(String(newPassword)));
+  await addAuditLog('ADMIN_PASSWORD_CHANGED', `Admin "${admin.username}" updated password`, admin.username);
   res.json({ ok: true });
 });
 
@@ -862,25 +848,32 @@ app.post('/api/auth/change-password', requireAdmin, (req, res) => {
 // ADMIN PROTECTED ENDPOINTS
 // ==========================================
 
-app.get('/api/admin/bootstrap', requireAdmin, (_req, res) => {
+app.get('/api/admin/bootstrap', requireAdmin, async (_req, res) => {
+  const [members, payments, plans, settings, auditLogs, smsLogs, notices] = await Promise.all([
+    getAllMembers(),
+    getAllPayments(),
+    getPlans(),
+    getSettings(),
+    getAuditLogs(),
+    getSmsLogs(),
+    getAllNotices(),
+  ]);
   res.json({
-    members: getAllMembers(),
-    payments: getAllPayments(),
-    plans: getPlans(),
-    settings: getSettings(),
-    auditLogs: getAuditLogs(),
-    smsLogs: getSmsLogs(),
-    notices: getAllNotices(),
+    members,
+    payments,
+    plans,
+    settings,
+    auditLogs,
+    smsLogs,
+    notices,
+    database: isPostgres ? 'postgresql' : 'sqlite',
     shurjopayMode: (process.env.SHURJOPAY_MODE || 'sandbox').toLowerCase(),
     smsSenderId: process.env.GREENWEB_SENDER_ID || '8809617621831',
   });
 });
 
-// ==========================================
-// ADMIN NOTICES & PRESS RELEASES
-// ==========================================
-
-app.post('/api/admin/notices', requireAdmin, (req, res) => {
+// Admin Notices
+app.post('/api/admin/notices', requireAdmin, async (req, res) => {
   const { date, title, description, attachmentName, attachmentType, attachmentData } = req.body || {};
   if (!title || !description) {
     return res.status(400).json({ error: 'Notice title and description are required.' });
@@ -894,30 +887,31 @@ app.post('/api/admin/notices', requireAdmin, (req, res) => {
     attachmentType: attachmentType || null,
     attachmentData: attachmentData || null,
   };
-  insertNotice(notice);
-  addAuditLog('NOTICE_PUBLISHED', `Published notice: "${notice.title}"`, req.admin.username);
-  res.status(201).json({ notice, notices: getAllNotices() });
+  await insertNotice(notice);
+  await addAuditLog('NOTICE_PUBLISHED', `Published notice: "${notice.title}"`, req.admin.username);
+  res.status(201).json({ notice, notices: await getAllNotices() });
 });
 
-app.delete('/api/admin/notices/:id', requireAdmin, (req, res) => {
-  deleteNoticeById(req.params.id);
-  addAuditLog('NOTICE_DELETED', `Deleted notice ${req.params.id}`, req.admin.username);
-  res.json({ ok: true, notices: getAllNotices() });
+app.delete('/api/admin/notices/:id', requireAdmin, async (req, res) => {
+  await deleteNoticeById(req.params.id);
+  await addAuditLog('NOTICE_DELETED', `Deleted notice ${req.params.id}`, req.admin.username);
+  res.json({ ok: true, notices: await getAllNotices() });
 });
 
-// ==========================================
-// DUE REMINDER ENGINE (7th of Every Month at 4:00 PM BST + Manual Admin Trigger)
-// ==========================================
-
+// Due Reminder Engine
 function buildDueReminderBanglaMessage(amount) {
   return `প্রিয় সদস্য, আমাদের রেকর্ড অনুযায়ী আপনার মাসিক চাঁদা এখনো বকেয়া রয়েছে। অনুগ্রহ করে বকেয়া পেমেন্টঃ ${Number(amount).toLocaleString()} টাকা পরিশোধ করুন। উল্লেখ্য, প্রতি মাসের ১০ তারিখের মধ্যে মাসিক পেমেন্ট/ইনস্টলমেন্ট পরিশোধ করার অনুরোধ রইল।\nধন্যবাদান্তে,\nআরমানিটোলিয়ান্স ক্লাব`;
 }
 
-function computeOverdueMembers(targetMonth) {
-  const settings = getSettings();
-  const plans = getPlans();
-  const allMembers = getAllMembers().filter((m) => m.status === 'approved');
-  const allPayments = getAllPayments().filter((p) => p.status === 'verified');
+async function computeOverdueMembers(targetMonth) {
+  const [settings, plans, allMembersRaw, allPaymentsRaw] = await Promise.all([
+    getSettings(),
+    getPlans(),
+    getAllMembers(),
+    getAllPayments(),
+  ]);
+  const allMembers = allMembersRaw.filter((m) => m.status === 'approved');
+  const allPayments = allPaymentsRaw.filter((p) => p.status === 'verified');
   const overdue = [];
 
   for (const m of allMembers) {
@@ -942,17 +936,17 @@ function computeOverdueMembers(targetMonth) {
   return overdue;
 }
 
-app.get('/api/admin/dues/preview', requireAdmin, (req, res) => {
+app.get('/api/admin/dues/preview', requireAdmin, async (req, res) => {
   const month = String(req.query.month || new Date().toISOString().slice(0, 7));
-  const overdue = computeOverdueMembers(month);
+  const overdue = await computeOverdueMembers(month);
   res.json({ month, overdue, totalOverdueAmount: overdue.reduce((s, x) => s + x.dueAmount, 0) });
 });
 
 app.post('/api/admin/dues/send-reminders', requireAdmin, async (req, res) => {
   const month = String(req.body?.month || new Date().toISOString().slice(0, 7));
-  const overdue = computeOverdueMembers(month);
+  const overdue = await computeOverdueMembers(month);
   if (overdue.length === 0) {
-    return res.json({ ok: true, sentCount: 0, totalCount: 0, smsLogs: getSmsLogs() });
+    return res.json({ ok: true, sentCount: 0, totalCount: 0, smsLogs: await getSmsLogs() });
   }
 
   let sentCount = 0;
@@ -967,16 +961,15 @@ app.post('/api/admin/dues/send-reminders', requireAdmin, async (req, res) => {
     if (result.ok) sentCount++;
   }
 
-  addAuditLog(
+  await addAuditLog(
     'DUE_REMINDERS_SENT',
     `Sent Due Reminder SMS for ${month} to ${overdue.length} overdue members (${sentCount} delivered)`,
     req.admin.username
   );
 
-  res.json({ ok: true, sentCount, totalCount: overdue.length, smsLogs: getSmsLogs() });
+  res.json({ ok: true, sentCount, totalCount: overdue.length, smsLogs: await getSmsLogs() });
 });
 
-// Vercel Scheduled Cron Endpoint: Runs every month on the 7th at 4:00 PM BST (10:00 UTC)
 app.get('/api/cron/due-reminders', async (req, res) => {
   const cronSecret = process.env.CRON_SECRET;
   const authHeader = req.headers.authorization || '';
@@ -985,7 +978,7 @@ app.get('/api/cron/due-reminders', async (req, res) => {
   }
 
   const currentMonth = new Date().toISOString().slice(0, 7);
-  const overdue = computeOverdueMembers(currentMonth);
+  const overdue = await computeOverdueMembers(currentMonth);
   let sentCount = 0;
   for (const item of overdue) {
     if (!item.phone) continue;
@@ -997,7 +990,7 @@ app.get('/api/cron/due-reminders', async (req, res) => {
     });
     if (result.ok) sentCount++;
   }
-  addAuditLog(
+  await addAuditLog(
     'CRON_DUE_REMINDER',
     `Automated 7th-day 4PM Due Reminder dispatched for ${currentMonth}: ${sentCount}/${overdue.length} delivered`,
     'System Cron'
@@ -1005,7 +998,7 @@ app.get('/api/cron/due-reminders', async (req, res) => {
   res.json({ ok: true, month: currentMonth, sentCount, totalCount: overdue.length });
 });
 
-// Admin: Send Manual, Personalized Template, or Bulk SMS via GreenWeb
+// Admin SMS Send
 app.post('/api/admin/sms/send', requireAdmin, async (req, res) => {
   const { recipients, message } = req.body || {};
   if (!Array.isArray(recipients) || recipients.length === 0 || !String(message || '').trim()) {
@@ -1015,10 +1008,9 @@ app.post('/api/admin/sms/send', requireAdmin, async (req, res) => {
   const rawMsg = String(message).trim();
   const isPersonalized = rawMsg.includes('{Name}');
 
-  let okCount = 0;
-  let lastProviderResp = '';
-
   if (isPersonalized && recipients.length > 1) {
+    let okCount = 0;
+    let lastProviderResp = '';
     for (const r of recipients) {
       if (!r.phone) continue;
       const personalMsg = rawMsg.replaceAll('{Name}', r.name || 'Member');
@@ -1031,7 +1023,7 @@ app.post('/api/admin/sms/send', requireAdmin, async (req, res) => {
       if (result.ok) okCount++;
       lastProviderResp = result.providerResponse;
     }
-    addAuditLog(
+    await addAuditLog(
       'SMS_SENT',
       `Admin sent personalized notification SMS to ${recipients.length} members (${okCount} delivered)`,
       req.admin.username
@@ -1041,7 +1033,7 @@ app.post('/api/admin/sms/send', requireAdmin, async (req, res) => {
       deliveredCount: okCount,
       totalCount: recipients.length,
       providerResponse: lastProviderResp,
-      smsLogs: getSmsLogs(),
+      smsLogs: await getSmsLogs(),
     });
   }
 
@@ -1062,24 +1054,25 @@ app.post('/api/admin/sms/send', requireAdmin, async (req, res) => {
     message: finalMsg,
   });
 
-  addAuditLog(
+  await addAuditLog(
     'SMS_SENT',
     `Admin sent SMS to ${names} (${result.ok ? 'Delivered' : 'Failed'})`,
     req.admin.username
   );
 
-  res.json({ ok: result.ok, providerResponse: result.providerResponse, smsLogs: getSmsLogs() });
+  res.json({ ok: result.ok, providerResponse: result.providerResponse, smsLogs: await getSmsLogs() });
 });
 
-// Admin: Edit ANY member's data
-app.put('/api/admin/members/:id', requireAdmin, (req, res) => {
+// Admin Edit Member
+app.put('/api/admin/members/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
-  const existing = getAllMembers().find((m) => m.id === id);
+  const members = await getAllMembers();
+  const existing = members.find((m) => m.id === id);
   if (!existing) return res.status(404).json({ error: 'Member not found.' });
 
   const updated = { ...existing, ...req.body, id: existing.id };
-  upsertMember(updated);
-  addAuditLog(
+  await upsertMember(updated);
+  await addAuditLog(
     'MEMBER_UPDATED',
     `Admin updated profile/data for ${updated.fullName} (${updated.memberId || updated.id})`,
     req.admin.username
@@ -1087,11 +1080,11 @@ app.put('/api/admin/members/:id', requireAdmin, (req, res) => {
   res.json({ member: updated });
 });
 
-// Admin: Review (Approve / Revision / Reject)
-app.post('/api/admin/members/:id/review', requireAdmin, (req, res) => {
+// Admin Review Application
+app.post('/api/admin/members/:id/review', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { decision, remarks = '' } = req.body || {};
-  const all = getAllMembers();
+  const [all, plans] = await Promise.all([getAllMembers(), getPlans()]);
   const target = all.find((m) => m.id === id);
   if (!target) return res.status(404).json({ error: 'Application not found.' });
 
@@ -1100,7 +1093,7 @@ app.post('/api/admin/members/:id/review', requireAdmin, (req, res) => {
     const approvedCount = all.filter((x) => x.status === 'approved').length + 1;
     const generatedMemberId =
       target.memberId || `AC-${target.batch || '2026'}-${String(approvedCount).padStart(4, '0')}`;
-    const plan = getPlans().find((p) => p.id === target.planId);
+    const plan = plans.find((p) => p.id === target.planId);
     updated = {
       ...target,
       status: 'approved',
@@ -1113,25 +1106,24 @@ app.post('/api/admin/members/:id/review', requireAdmin, (req, res) => {
     updated = { ...target, status: decision, remarks };
   }
 
-  upsertMember(updated);
-  addAuditLog(
+  await upsertMember(updated);
+  await addAuditLog(
     `APPLICATION_${String(decision).toUpperCase()}`,
     `${String(decision).toUpperCase()} application ${id} (${target.fullName})${remarks ? ` — ${remarks}` : ''}`,
     req.admin.username
   );
 
-  // Auto SMS on Approve / Revision / Reject
   let smsText = '';
   let triggerType = 'AUTO_REVIEW';
   if (decision === 'approved') {
     triggerType = 'AUTO_APPROVED';
-    smsText = `Congratulations ${updated.fullName}! Your Armanitollian Club membership is APPROVED. Official Club ID: ${updated.memberId}. Use your Club ID & Phone to view/pay subscriptions.`;
+    smsText = `Congratulations ${updated.fullName}! Your Armanitolians Club membership is APPROVED. Official Club ID: ${updated.memberId}. Use your Club ID & Phone to view/pay subscriptions.`;
   } else if (decision === 'revision') {
     triggerType = 'AUTO_REVISION';
-    smsText = `Dear ${updated.fullName}, your Armanitollian Club application (${updated.id}) requires revision.${remarks ? ` Remarks: ${remarks}` : ''} Please contact the club office.`;
+    smsText = `Dear ${updated.fullName}, your Armanitolians Club application (${updated.id}) requires revision.${remarks ? ` Remarks: ${remarks}` : ''} Please track your application and edit via OTP.`;
   } else if (decision === 'rejected') {
     triggerType = 'AUTO_REJECTED';
-    smsText = `Dear ${updated.fullName}, we regret to inform you that your Armanitollian Club application (${updated.id}) was not approved.${remarks ? ` Reason: ${remarks}` : ''}`;
+    smsText = `Dear ${updated.fullName}, we regret to inform you that your Armanitolians Club application (${updated.id}) was not approved.${remarks ? ` Reason: ${remarks}` : ''}`;
   }
 
   if (smsText && updated.phone) {
@@ -1146,11 +1138,10 @@ app.post('/api/admin/members/:id/review', requireAdmin, (req, res) => {
   res.json({ member: updated });
 });
 
-// Admin: Record manual payment
-app.post('/api/admin/payments', requireAdmin, (req, res) => {
+// Admin Record Payment
+app.post('/api/admin/payments', requireAdmin, async (req, res) => {
   const body = req.body || {};
-  const settings = getSettings();
-  const existing = getAllPayments();
+  const [settings, existing] = await Promise.all([getSettings(), getAllPayments()]);
   const seq = 8801 + existing.length;
   const isAutoVerified = body.method === 'Cash' && settings.autoApproveCash;
 
@@ -1160,8 +1151,8 @@ app.post('/api/admin/payments', requireAdmin, (req, res) => {
     date: new Date().toISOString().slice(0, 10),
     status: body.status || (isAutoVerified ? 'verified' : 'pending'),
   };
-  upsertPayment(newPayment);
-  addAuditLog(
+  await upsertPayment(newPayment);
+  await addAuditLog(
     'PAYMENT_RECORDED',
     `Recorded ৳${newPayment.amount} (${newPayment.method}) for ${newPayment.memberName} (${newPayment.month})`,
     req.admin.username
@@ -1169,55 +1160,56 @@ app.post('/api/admin/payments', requireAdmin, (req, res) => {
   res.status(201).json({ payment: newPayment });
 });
 
-// Admin: Verify pending payment
-app.post('/api/admin/payments/:id/verify', requireAdmin, (req, res) => {
+// Admin Verify Payment
+app.post('/api/admin/payments/:id/verify', requireAdmin, async (req, res) => {
   const { id } = req.params;
-  const target = getAllPayments().find((p) => p.id === id);
+  const [allPayments, members] = await Promise.all([getAllPayments(), getAllMembers()]);
+  const target = allPayments.find((p) => p.id === id);
   if (!target) return res.status(404).json({ error: 'Payment not found.' });
 
   const updated = { ...target, status: 'verified' };
-  upsertPayment(updated);
-  addAuditLog(
+  await upsertPayment(updated);
+  await addAuditLog(
     'PAYMENT_VERIFIED',
     `Verified receipt ${id} (৳${updated.amount}) for ${updated.memberName}`,
     req.admin.username
   );
 
-  const memberObj = getAllMembers().find((m) => m.memberId === updated.memberId);
+  const memberObj = members.find((m) => m.memberId === updated.memberId);
   if (memberObj?.phone) {
     dispatchSms({
       to: memberObj.phone,
       recipientName: updated.memberName,
       triggerType: 'AUTO_PAYMENT_SUCCESS',
-      message: `Dear ${updated.memberName}, your Armanitollian Club payment of BDT ${Number(updated.amount).toLocaleString()} (${updated.installmentLabel || updated.month}) has been VERIFIED. Receipt: ${id}. Thank you.`,
+      message: `Dear ${updated.memberName}, your Armanitolians Club payment of BDT ${Number(updated.amount).toLocaleString()} (${updated.installmentLabel || updated.month}) has been VERIFIED. Receipt: ${id}. Thank you.`,
     }).catch(() => {});
   }
 
   res.json({ payment: updated });
 });
 
-// Admin: Update Subscription Plans (including enable/disable & allowInstallment)
-app.put('/api/admin/plans', requireAdmin, (req, res) => {
+// Admin Update Plans
+app.put('/api/admin/plans', requireAdmin, async (req, res) => {
   const plans = req.body?.plans;
   if (!Array.isArray(plans)) return res.status(400).json({ error: 'Invalid plans array.' });
-  savePlans(plans);
-  addAuditLog('PLANS_UPDATED', 'Admin updated subscription plans / availability', req.admin.username);
+  await savePlans(plans);
+  await addAuditLog('PLANS_UPDATED', 'Admin updated subscription plans / availability', req.admin.username);
   res.json({ plans });
 });
 
-// Admin: Update Settings
-app.put('/api/admin/settings', requireAdmin, (req, res) => {
+// Admin Update Settings
+app.put('/api/admin/settings', requireAdmin, async (req, res) => {
   const settings = req.body?.settings;
   if (!settings || typeof settings !== 'object') {
     return res.status(400).json({ error: 'Invalid settings payload.' });
   }
-  saveSettings(settings);
-  addAuditLog('SETTINGS_UPDATED', 'Admin updated club configuration & settings', req.admin.username);
+  await saveSettings(settings);
+  await addAuditLog('SETTINGS_UPDATED', 'Admin updated club configuration & settings', req.admin.username);
   res.json({ settings });
 });
 
 // ==========================================
-// ADMIN REPORT GENERATION (ENCRYPTED ACCESS CODE PROTECTED)
+// ADMIN REPORT GENERATION (ENCRYPTED ACCESS CODE)
 // ==========================================
 
 function matchesBatchFilter(batchStr, filterMode, singleBatch, multiBatchInput) {
@@ -1271,11 +1263,11 @@ function getBatchFilterLabel(filterMode, singleBatch, multiBatchInput) {
   }
 }
 
-app.post('/api/admin/reports/verify-code', requireAdmin, (req, res) => {
+app.post('/api/admin/reports/verify-code', requireAdmin, async (req, res) => {
   const code = String(req.body?.accessCode || '').trim();
-  const check = verifyReportAccessCode(code);
+  const check = await verifyReportAccessCode(code);
   if (!check.valid) {
-    addAuditLog('REPORT_ACCESS_DENIED', 'Invalid report access code entered', req.admin.username);
+    await addAuditLog('REPORT_ACCESS_DENIED', 'Invalid report access code entered', req.admin.username);
     return res.status(403).json({ error: 'Invalid Access Code. Report generation denied.' });
   }
 
@@ -1284,11 +1276,11 @@ app.post('/api/admin/reports/verify-code', requireAdmin, (req, res) => {
     purpose: 'report_generation',
     codeLabel: check.label,
   });
-  addAuditLog('REPORT_ACCESS_GRANTED', `Report access granted (${check.label})`, req.admin.username);
+  await addAuditLog('REPORT_ACCESS_GRANTED', `Report access granted (${check.label})`, req.admin.username);
   res.json({ valid: true, reportToken, codeLabel: check.label });
 });
 
-app.post('/api/admin/reports/generate', requireAdmin, (req, res) => {
+app.post('/api/admin/reports/generate', requireAdmin, async (req, res) => {
   const {
     reportToken,
     reportType = 'monthly_payment',
@@ -1304,10 +1296,12 @@ app.post('/api/admin/reports/generate', requireAdmin, (req, res) => {
     return res.status(403).json({ error: 'Valid Report Access Code verification is required.' });
   }
 
-  const settings = getSettings();
-  const plans = getPlans();
-  const allMembers = getAllMembers();
-  const allPayments = getAllPayments();
+  const [settings, plans, allMembers, allPayments] = await Promise.all([
+    getSettings(),
+    getPlans(),
+    getAllMembers(),
+    getAllPayments(),
+  ]);
 
   const approvedMembers = allMembers.filter(
     (m) =>
@@ -1340,7 +1334,7 @@ app.post('/api/admin/reports/generate', requireAdmin, (req, res) => {
       };
     });
 
-    addAuditLog(
+    await addAuditLog(
       'REPORT_GENERATED',
       `Generated Member List Report (${batchLabel} · ${memberTypeLabel} · ${rows.length} members)`,
       req.admin.username
@@ -1361,7 +1355,6 @@ app.post('/api/admin/reports/generate', requireAdmin, (req, res) => {
     });
   }
 
-  // Monthly Payment Report ("Payment Months Means: Payments received of that Month")
   const memberById = new Map(approvedMembers.map((m) => [m.memberId, m]));
   const receivedInMonth = allPayments.filter(
     (p) =>
@@ -1370,7 +1363,6 @@ app.post('/api/admin/reports/generate', requireAdmin, (req, res) => {
       memberById.has(p.memberId)
   );
 
-  // Group multiple installments received for the same member in that month
   const paidGrouped = new Map();
   for (const p of receivedInMonth) {
     const m = memberById.get(p.memberId);
@@ -1410,7 +1402,6 @@ app.post('/api/admin/reports/generate', requireAdmin, (req, res) => {
 
   const totalPaid = paidList.reduce((sum, r) => sum + Number(r.amount || 0), 0);
 
-  // Payment Due List: Approved members in scope who have unpaid schedule items up to/including selected month
   const dueList = [];
   for (const m of approvedMembers) {
     const plan = plans.find((p) => p.id === m.planId);
@@ -1449,7 +1440,7 @@ app.post('/api/admin/reports/generate', requireAdmin, (req, res) => {
   const monthDate = new Date(Number(yStr) || 2027, (Number(mStr) || 1) - 1, 1);
   const monthLabel = monthDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
 
-  addAuditLog(
+  await addAuditLog(
     'REPORT_GENERATED',
     `Generated Monthly Payment Report (${monthLabel} · ${batchLabel} · Paid ৳${totalPaid}, Due ৳${totalDue})`,
     req.admin.username
@@ -1473,20 +1464,22 @@ app.post('/api/admin/reports/generate', requireAdmin, (req, res) => {
   });
 });
 
-// Admin: Reset Demo Data
-app.post('/api/admin/reset-demo', requireAdmin, (req, res) => {
-  seedIfEmpty(true);
-  addAuditLog('DEMO_RESET', 'Admin reset database to initial demo records', req.admin.username);
-  res.json({
-    members: getAllMembers(),
-    payments: getAllPayments(),
-    plans: getPlans(),
-    settings: getSettings(),
-    auditLogs: getAuditLogs(),
-  });
+// Admin Reset Demo
+app.post('/api/admin/reset-demo', requireAdmin, async (req, res) => {
+  await seedIfEmpty(true);
+  await addAuditLog('DEMO_RESET', 'Admin reset database to initial demo records', req.admin.username);
+  const [members, payments, plans, settings, auditLogs, notices] = await Promise.all([
+    getAllMembers(),
+    getAllPayments(),
+    getPlans(),
+    getSettings(),
+    getAuditLogs(),
+    getAllNotices(),
+  ]);
+  res.json({ members, payments, plans, settings, auditLogs, notices });
 });
 
-// Serve built frontend in non-Vercel Node production
+// Non-Vercel Node production server
 if (!process.env.VERCEL) {
   const DIST_DIR = path.resolve(process.cwd(), 'dist');
   if (fs.existsSync(DIST_DIR)) {
@@ -1497,9 +1490,18 @@ if (!process.env.VERCEL) {
     });
   }
 
-  app.listen(PORT, () => {
-    console.log(`Armanitollian Club API & SQLite DB listening on http://localhost:${PORT}`);
-  });
+  ensureDbReady()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(
+          `The Armanitolian's Club API (${isPostgres ? 'PostgreSQL' : 'SQLite'}) listening on http://localhost:${PORT}`
+        );
+      });
+    })
+    .catch((err) => {
+      console.error('Failed to initialize database:', err);
+      process.exit(1);
+    });
 }
 
 export default app;
