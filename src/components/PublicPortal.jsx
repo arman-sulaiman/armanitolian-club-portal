@@ -510,16 +510,16 @@ export default function PublicPortal() {
                         setPortalTab('payments');
                         setRoute('portal');
                       }}
-                      className="flex-1 py-2.5 px-5 rounded-full bg-[#004B76] hover:bg-[#003B5C] text-white text-sm font-semibold transition-colors"
+                      className="flex-1 py-2.5 px-4 rounded-full bg-[#004B76] hover:bg-[#003B5C] text-white text-sm font-semibold whitespace-nowrap transition-colors"
                     >
-                      {lang === 'bn' ? 'পেমেন্ট করুন' : 'Member payments'}
+                      {lang === 'bn' ? 'পেমেন্ট' : 'Payments'}
                     </button>
                     <button
                       onClick={() => {
                         setPortalTab('track');
                         setRoute('portal');
                       }}
-                      className="py-2.5 px-5 rounded-full border border-[#004B76] text-[#004B76] hover:bg-[#EBF4FA] text-sm font-semibold transition-colors"
+                      className="py-2.5 px-4 rounded-full border border-[#004B76] text-[#004B76] hover:bg-[#EBF4FA] text-sm font-semibold whitespace-nowrap transition-colors"
                     >
                       {lang === 'bn' ? 'আবেদন ট্র্যাক' : 'Track status'}
                     </button>
