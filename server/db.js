@@ -351,7 +351,7 @@ export function verifyReportAccessCode(plainCode) {
 }
 
 export function getAllNotices() {
-  return db.prepare('SELECT * FROM notices ORDER BY date DESC, created_at DESC').all();
+  return db.prepare('SELECT * FROM notices ORDER BY rowid DESC').all();
 }
 
 export function insertNotice(notice) {
