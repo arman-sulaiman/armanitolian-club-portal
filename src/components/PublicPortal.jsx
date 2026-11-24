@@ -369,7 +369,11 @@ export default function PublicPortal() {
               <div className="w-8 h-8 sm:w-9 sm:h-9 rounded flex items-center justify-center bg-[#004B76] text-white shrink-0">
                 <Award className="w-4 h-4 sm:w-5 sm:h-5" />
               </div>
-              <span className="h-7 sm:h-8 w-[3px] bg-gradient-to-b from-[#002B45] via-[#C8102E] to-[#D4A017] rounded-full" />
+              <span className="h-7 sm:h-8 w-[3px] flex flex-col overflow-hidden rounded-full shrink-0">
+                <span className="flex-1 bg-[#111827]" />
+                <span className="flex-1 bg-[#B91C1C]" />
+                <span className="flex-1 bg-[#006A4E]" />
+              </span>
             </div>
             <div className="flex flex-col sm:flex-row sm:items-baseline sm:gap-2.5 min-w-0">
               <span className="font-bold text-xs sm:text-base text-slate-900 tracking-tight truncate">
