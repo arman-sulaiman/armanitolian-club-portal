@@ -18,22 +18,26 @@ const PG_URL =
   process.env.STORAGE_URL ||
   process.env.STORAGE_DATABASE_URL ||
   process.env.STORAGE_POSTGRES_URL ||
-  Object.entries(process.env).find(
-    ([k, v]) =>
-      /postgres|neon|database|storage/i.test(k) && /^postgres(ql)?:\/\//i.test(String(v || ''))
-  )?.[1] ||
+  Object.values(process.env).find((v) => /^postgres(ql)?:\/\//i.test(String(v || ''))) ||
   '';
-export const isPostgres = Boolean(PG_URL);
+export const isPostgres = Boolean(PG_URL || process.env.PGHOST);
 
 let pgPool = null;
 let sqliteDb = null;
 
 if (isPostgres) {
-  pgPool = new Pool({
-    connectionString: PG_URL,
-    ssl: PG_URL.includes('localhost') || PG_URL.includes('127.0.0.1') ? false : { rejectUnauthorized: false },
-    max: 5,
-  });
+  pgPool = new Pool(
+    PG_URL
+      ? {
+          connectionString: PG_URL,
+          ssl: PG_URL.includes('localhost') || PG_URL.includes('127.0.0.1') ? false : { rejectUnauthorized: false },
+          max: 5,
+        }
+      : {
+          ssl: { rejectUnauthorized: false },
+          max: 5,
+        }
+  );
 } else {
   const { DatabaseSync } = await import('node:sqlite');
   const DATA_DIR = process.env.VERCEL
